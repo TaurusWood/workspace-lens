@@ -103,6 +103,9 @@ This project is in early design and MVP implementation planning.
 
 See:
 
+- [Product Experience](docs/product-experience.md)
+- [Security Model](docs/security-model.md)
+- [MCP Tools Specification](docs/mcp-tools-spec.md)
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
 
