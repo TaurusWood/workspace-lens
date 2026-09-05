@@ -6,7 +6,7 @@ export function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
 }
 
-export function initRepo(root: string, files: Record<string, string> = {}): void {
+export function initRepo(root: string, files: Record<string, string | Buffer> = {}): void {
   fs.mkdirSync(root, { recursive: true });
   git(root, "init", "-q", "-b", "main", root);
   git(root, "config", "user.email", "test@example.com");
