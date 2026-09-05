@@ -37,7 +37,14 @@ describe("WorkspaceLens MCP server", () => {
     const { client } = await connectClient();
     const tools = await client.listTools();
     const names = tools.tools.map((tool) => tool.name).sort();
-    expect(names).toEqual(["list_files", "read_file", "search_workspace", "workspace_list"]);
+    expect(names).toEqual([
+      "git_diff",
+      "git_status",
+      "list_files",
+      "read_file",
+      "search_workspace",
+      "workspace_list",
+    ]);
     for (const tool of tools.tools) {
       expect((tool.inputSchema as { additionalProperties?: boolean }).additionalProperties).toBe(
         false,

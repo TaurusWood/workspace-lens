@@ -4,7 +4,9 @@ import path from "node:path";
 import type { CliIo } from "../../src/cli/io.js";
 
 export function makeTempDir(prefix = "wl-test-"): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  // Canonicalize: on macOS /tmp and /var/folders are symlinks, and the git
+  // adapter compares roots against realpathed toplevels.
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
 export function realPath(target: string): string {
