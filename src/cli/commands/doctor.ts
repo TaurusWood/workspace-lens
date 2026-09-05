@@ -3,6 +3,11 @@ import { ConfigStore, describeError } from "../../config/config-store.js";
 import { ConfigError } from "../../config/config-schema.js";
 import { WorkspaceRegistry } from "../../core/workspace-registry.js";
 import type { WorkspaceLensConfig } from "../../config/config-schema.js";
+import {
+  detectTunnelClient,
+  DEFAULT_PROFILE_NAME,
+  readProfile,
+} from "../../integrations/openai/tunnel.js";
 import { createToolContext, createWorkspaceLensServer } from "../../mcp/server.js";
 import type { CliIo } from "../io.js";
 import { writeLine } from "../io.js";
@@ -87,6 +92,26 @@ export async function runDoctor(_args: readonly string[], io: CliIo): Promise<nu
       }
     } catch (error) {
       checks.push({ name: "mcp-server", ok: false, detail: describeError(error) });
+    }
+
+    // Provider integration prerequisites (optional; only reported when installed).
+    const tunnel = await detectTunnelClient();
+    if (tunnel.installed) {
+      const profile = readProfile(DEFAULT_PROFILE_NAME);
+      checks.push({
+        name: "chatgpt-tunnel",
+        ok: true,
+        detail:
+          profile !== null
+            ? `tunnel-client installed; profile at ${profile.path}`
+            : "tunnel-client installed; no product profile yet (workspace-lens connect chatgpt)",
+      });
+    } else {
+      checks.push({
+        name: "chatgpt-tunnel",
+        ok: true,
+        detail: "tunnel-client not installed (optional ChatGPT integration)",
+      });
     }
   }
 

@@ -1,5 +1,6 @@
 import { SERVER_VERSION } from "../version.js";
 import { runAdd } from "./commands/add.js";
+import { runConnectChatGpt } from "./commands/connect-chatgpt.js";
 import { runDoctor } from "./commands/doctor.js";
 import { runList } from "./commands/list.js";
 import { runRemove } from "./commands/remove.js";
@@ -15,6 +16,8 @@ Usage:
   workspace-lens remove <workspace>                      Remove an authorized workspace
   workspace-lens serve                                   Start the MCP server on stdio
   workspace-lens doctor                                  Check local setup prerequisites
+  workspace-lens connect chatgpt [--tunnel-id <id>] [--run]
+                                                         Set up the official ChatGPT tunnel flow
   workspace-lens version                                 Print the version
 `;
 
@@ -37,6 +40,12 @@ async function dispatch(args: readonly string[], io: CliIo): Promise<number> {
       return runServe();
     case "doctor":
       return runDoctor(rest, io);
+    case "connect":
+      if (rest[0] !== "chatgpt") {
+        io.err.write("Usage: workspace-lens connect chatgpt [--tunnel-id <id>] [--run]\n");
+        return 2;
+      }
+      return runConnectChatGpt(rest.slice(1), io);
     case "version":
     case "--version":
     case "-V":

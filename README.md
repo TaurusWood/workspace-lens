@@ -135,9 +135,9 @@ Workspace access is limited to explicitly configured workspace roots. All paths 
 
 WorkspaceLens cannot modify files, execute commands, or run arbitrary Git/search arguments. Workspace content is returned as untrusted data.
 
-## ChatGPT Connection (Gate 0)
+## ChatGPT Connection
 
-ChatGPT cannot reach `localhost` directly. The documented OpenAI path is **Secure MCP Tunnel** with the official `tunnel-client`. Gate 0 validates this path with a disposable server before product integration work proceeds.
+ChatGPT cannot reach `localhost` directly. The supported path is the official OpenAI **Secure MCP Tunnel** with `tunnel-client`. Gate 0 validation passed on the development environment: a real ChatGPT conversation discovered and repeatedly called the connection-test tool through the tunnel, recovered after a daemon restart, and honestly surfaced the stopped-service failure.
 
 Prerequisites (OpenAI-side, require your accounts):
 
@@ -146,43 +146,36 @@ Prerequisites (OpenAI-side, require your accounts):
 3. The official client from `github.com/openai/tunnel-client/releases/latest`.
 4. ChatGPT **developer mode** enabled for your workspace (Business/Enterprise/Edu; Pro supports read/fetch connectors).
 
-Validation steps:
+Product setup:
 
 ```bash
-# Optional preflight: verifies the local prerequisites (Node 24, built
-# gate0 server answering MCP over stdio, tunnel-client presence) and
-# prints the ready-to-paste commands below with absolute paths.
-./scripts/gate0-preflight.sh
-
-# Build the disposable connection-test server (workspace_list only, no filesystem access)
 npm run build
-
-tunnel-client init \
-  --sample sample_mcp_stdio_local \
-  --profile workspace-lens-gate0 \
-  --tunnel-id <your-tunnel-id> \
-  --mcp-command "node /absolute/path/to/workspace-lens/dist/gate0/connection-test-server.js"
-
-tunnel-client doctor --profile workspace-lens-gate0 --explain
-tunnel-client run --profile workspace-lens-gate0
+workspace-lens add /path/to/your/project
+export CONTROL_PLANE_API_KEY="<runtime key>"
+workspace-lens connect chatgpt --tunnel-id <your-tunnel-id>   # creates the profile via official init
+workspace-lens connect chatgpt                                 # re-check + print next steps
+tunnel-client run --profile workspace-lens                     # keep the tunnel alive
 ```
 
-Then in ChatGPT: create a developer-mode app, pick **Tunnel** under Connection, select your tunnel, and call `workspace_list` from a real chat. Gate 0 passes only when discovery, repeated calls, restarts, and stop-state failures behave reliably on your account.
+Then in ChatGPT: create a developer-mode app, pick **Tunnel** under Connection, select your tunnel, and call `workspace_list` from a real chat.
 
 ## Status
 
-The local Core (`v0.1` phases 1–9 of `docs/implementation-plan.md`) is implemented and covered by the automated contract/security suites:
+`v0.1` phases 1–10 of `docs/implementation-plan.md` are implemented and covered by automated suites (typecheck + 215 tests):
 
 ```bash
 npm run typecheck
 npm test
 ```
 
-Open items requiring a real user environment:
+Validated on the development environment:
 
-- **Gate 0**: validate the real ChatGPT connection path (steps above).
-- **Phase 10**: `workspace-lens connect chatgpt` — proceeds only after Gate 0 passes.
-- **Phase 11**: end-to-end product validation in a real reviewer chat.
+- **Gate 0**: a real ChatGPT conversation reached the disposable connection-test server through the official tunnel path (discovery, repeated calls, restart recovery, honest stop-failure).
+
+Open items:
+
+- **Phase 11**: end-to-end review validation in a real ChatGPT conversation against a fully authorized workspace (the tool contract itself is fully covered by automated fixture suites).
+- Gate 0 observation recorded: with the tunnel daemon stopped, ChatGPT surfaces an empty tool result instead of an explicit error message (platform-level behavior, outside WorkspaceLens Core).
 
 See:
 
