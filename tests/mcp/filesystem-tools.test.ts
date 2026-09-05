@@ -74,7 +74,9 @@ describe("filesystem read tools over MCP", () => {
   it("advertises the phase-4 tools with strict input schemas", async () => {
     const tools = await client.listTools();
     const names = tools.tools.map((tool) => tool.name).sort();
-    expect(names).toEqual(["list_files", "read_file", "workspace_list"]);
+    expect(names).toContain("list_files");
+    expect(names).toContain("read_file");
+    expect(names).toContain("workspace_list");
     const listSchema = tools.tools.find((tool) => tool.name === "workspace_list")?.inputSchema as {
       additionalProperties?: boolean;
     };

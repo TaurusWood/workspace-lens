@@ -8,6 +8,7 @@ import type { ToolContext } from "./context.js";
 import { createToolHandler } from "./tool-runner.js";
 import { listFilesTool } from "./tools/list-files.js";
 import { readFileTool } from "./tools/read-file.js";
+import { searchWorkspaceTool } from "./tools/search-workspace.js";
 import { workspaceListTool } from "./tools/workspace-list.js";
 
 export interface ServerOptions {
@@ -34,7 +35,7 @@ export function createToolContext(
 export function createWorkspaceLensServer(context: ToolContext): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
-  const tools = [workspaceListTool, listFilesTool, readFileTool] as const;
+  const tools = [workspaceListTool, listFilesTool, readFileTool, searchWorkspaceTool] as const;
   for (const tool of tools) {
     server.registerTool(
       tool.name,
