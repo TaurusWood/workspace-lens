@@ -386,6 +386,37 @@ export class GitAdapter {
   }
 
   /**
+   * Head metadata for `workspace_info`: branch/detached plus the short
+   * HEAD commit (null on an unborn branch). Non-Git roots are reported as
+   * `detected: false` instead of erroring.
+   */
+  async headInfo(
+    root: string,
+  ): Promise<{ detected: boolean; branch: GitBranchInfo; head: string | null }> {
+    const branch: GitBranchInfo = {
+      name: null,
+      detached: false,
+      upstream: null,
+      ahead: null,
+      behind: null,
+    };
+    try {
+      const status = await this.status(root);
+      const head = await runGit(root, ["rev-parse", "--short", "HEAD"]);
+      return {
+        detected: true,
+        branch: status.branch,
+        head: head.code === 0 ? head.stdout.trim() || null : null,
+      };
+    } catch (error) {
+      if (error instanceof AppError && error.code === "NOT_A_GIT_REPOSITORY") {
+        return { detected: false, branch, head: null };
+      }
+      throw error;
+    }
+  }
+
+  /**
    * `git_status` (`mcp-tools-spec.md` §11): machine-readable porcelain,
    * parsed into the structured contract, with AccessPolicy applied before
    * any path crosses the boundary. Blocked changes contribute to

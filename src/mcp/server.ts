@@ -11,6 +11,7 @@ import { gitStatusTool } from "./tools/git-status.js";
 import { listFilesTool } from "./tools/list-files.js";
 import { readFileTool } from "./tools/read-file.js";
 import { searchWorkspaceTool } from "./tools/search-workspace.js";
+import { workspaceInfoTool } from "./tools/workspace-info.js";
 import { workspaceListTool } from "./tools/workspace-list.js";
 
 export interface ServerOptions {
@@ -39,6 +40,7 @@ export function createWorkspaceLensServer(context: ToolContext): McpServer {
 
   const tools = [
     workspaceListTool,
+    workspaceInfoTool,
     listFilesTool,
     readFileTool,
     searchWorkspaceTool,

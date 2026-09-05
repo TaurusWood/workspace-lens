@@ -43,6 +43,7 @@ describe("WorkspaceLens MCP server", () => {
       "list_files",
       "read_file",
       "search_workspace",
+      "workspace_info",
       "workspace_list",
     ]);
     for (const tool of tools.tools) {

@@ -25,6 +25,14 @@ function toRegistered(ws: WorkspaceConfig): RegisteredWorkspace {
 export class WorkspaceRegistry {
   constructor(private readonly config: WorkspaceLensConfig) {}
 
+  /**
+   * Local-only option: when enabled, workspace_info may return the
+   * canonical absolute root path (`mcp-tools-spec.md` §7).
+   */
+  get exposeAbsolutePaths(): boolean {
+    return this.config.expose_absolute_paths;
+  }
+
   /** All registered workspaces, including disabled ones. */
   listAll(): RegisteredWorkspace[] {
     return this.config.workspaces.map(toRegistered);
