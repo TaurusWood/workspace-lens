@@ -149,6 +149,11 @@ Prerequisites (OpenAI-side, require your accounts):
 Validation steps:
 
 ```bash
+# Optional preflight: verifies the local prerequisites (Node 24, built
+# gate0 server answering MCP over stdio, tunnel-client presence) and
+# prints the ready-to-paste commands below with absolute paths.
+./scripts/gate0-preflight.sh
+
 # Build the disposable connection-test server (workspace_list only, no filesystem access)
 npm run build
 
