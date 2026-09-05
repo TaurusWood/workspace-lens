@@ -8,9 +8,9 @@ import { createToolContext, createWorkspaceLensServer } from "../../mcp/server.j
 /**
  * Run the WorkspaceLens MCP server in the foreground on stdio transport.
  * The process stays alive until the client closes the stream or a signal
- * is received.
+ * is received. Returns 0 once serving, or 1 when startup failed.
  */
-export async function runServe(): Promise<void> {
+export async function runServe(): Promise<number> {
   const logger = new StderrLogger();
 
   let registry: WorkspaceRegistry;
@@ -21,8 +21,7 @@ export async function runServe(): Promise<void> {
     if (error instanceof ConfigError) {
       // Fail safely: never run against a partially interpreted config.
       process.stderr.write(`error: ${describeError(error)}\n`);
-      process.exitCode = 1;
-      return;
+      return 1;
     }
     throw error;
   }
@@ -50,4 +49,5 @@ export async function runServe(): Promise<void> {
   };
 
   logger.event("server_started", "WorkspaceLens MCP server listening on stdio");
+  return 0;
 }

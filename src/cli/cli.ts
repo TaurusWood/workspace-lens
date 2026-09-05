@@ -1,5 +1,6 @@
 import { SERVER_VERSION } from "../version.js";
 import { runAdd } from "./commands/add.js";
+import { runDoctor } from "./commands/doctor.js";
 import { runList } from "./commands/list.js";
 import { runRemove } from "./commands/remove.js";
 import { runServe } from "./commands/serve.js";
@@ -13,6 +14,7 @@ Usage:
   workspace-lens list                                    List authorized workspaces
   workspace-lens remove <workspace>                      Remove an authorized workspace
   workspace-lens serve                                   Start the MCP server on stdio
+  workspace-lens doctor                                  Check local setup prerequisites
   workspace-lens version                                 Print the version
 `;
 
@@ -32,8 +34,9 @@ async function dispatch(args: readonly string[], io: CliIo): Promise<number> {
     case "remove":
       return runRemove(rest, io);
     case "serve":
-      await runServe();
-      return 0;
+      return runServe();
+    case "doctor":
+      return runDoctor(rest, io);
     case "version":
     case "--version":
     case "-V":
