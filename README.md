@@ -171,11 +171,12 @@ npm test
 Validated on the development environment:
 
 - **Gate 0**: a real ChatGPT conversation reached the disposable connection-test server through the official tunnel path (discovery, repeated calls, restart recovery, honest stop-failure).
+- **Phase 11**: a real ChatGPT review conversation used the full product server through the same tunnel to inspect local uncommitted changes (`pocket-railway`, real repository, no GitHub push, no file upload, read-only).
 
-Open items:
+Recorded UX observations (`implementation-plan.md` §18; noted, not fixed):
 
-- **Phase 11**: end-to-end review validation in a real ChatGPT conversation against a fully authorized workspace (the tool contract itself is fully covered by automated fixture suites).
-- Gate 0 observation recorded: with the tunnel daemon stopped, ChatGPT surfaces an empty tool result instead of an explicit error message (platform-level behavior, outside WorkspaceLens Core).
+- Reviewer models that have a built-in bash tool default to it unless the conversation attaches the WorkspaceLens app or the prompt names the connector tools explicitly.
+- With the tunnel daemon stopped, ChatGPT surfaces an empty tool result instead of an explicit error message (platform-level behavior, outside WorkspaceLens Core).
 
 See:
 
