@@ -1,4 +1,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ConfigStore, describeError } from "../../config/config-store.js";
+import { ConfigError } from "../../config/config-schema.js";
+import { WorkspaceRegistry } from "../../core/workspace-registry.js";
 import { StderrLogger } from "../../core/logger.js";
 import { createToolContext, createWorkspaceLensServer } from "../../mcp/server.js";
 
@@ -9,7 +12,22 @@ import { createToolContext, createWorkspaceLensServer } from "../../mcp/server.j
  */
 export async function runServe(): Promise<void> {
   const logger = new StderrLogger();
-  const context = createToolContext({ logger });
+
+  let registry: WorkspaceRegistry;
+  try {
+    const store = new ConfigStore();
+    registry = new WorkspaceRegistry(store.load());
+  } catch (error) {
+    if (error instanceof ConfigError) {
+      // Fail safely: never run against a partially interpreted config.
+      process.stderr.write(`error: ${describeError(error)}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+
+  const context = createToolContext({ registry, logger });
   const server = createWorkspaceLensServer(context);
 
   const shutdown = async (signal: string): Promise<void> => {

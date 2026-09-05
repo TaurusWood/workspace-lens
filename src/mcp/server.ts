@@ -1,41 +1,46 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { AccessPolicy } from "../core/access-policy.js";
 import { DEFAULT_LIMITS, type ServerLimits } from "../core/limits.js";
 import { type Logger, StderrLogger } from "../core/logger.js";
+import type { WorkspaceRegistry } from "../core/workspace-registry.js";
 import { SERVER_NAME, SERVER_VERSION } from "../version.js";
-
-/**
- * Shared context handed to every MCP tool handler. Tool handlers use this
- * context for orchestration only; filesystem security decisions live in the
- * core security kernel (`security-model.md` §4.5, `implementation-plan.md` §5).
- */
-export interface ToolContext {
-  limits: ServerLimits;
-  logger: Logger;
-}
+import type { ToolContext } from "./context.js";
+import { createToolHandler } from "./tool-runner.js";
+import { listFilesTool } from "./tools/list-files.js";
+import { readFileTool } from "./tools/read-file.js";
+import { workspaceListTool } from "./tools/workspace-list.js";
 
 export interface ServerOptions {
   limits?: Partial<ServerLimits>;
   logger?: Logger;
+  policy?: AccessPolicy;
 }
 
-export function createToolContext(options: ServerOptions = {}): ToolContext {
+export function createToolContext(
+  options: ServerOptions & { registry: WorkspaceRegistry },
+): ToolContext {
   return {
     limits: { ...DEFAULT_LIMITS, ...options.limits },
     logger: options.logger ?? new StderrLogger(),
+    registry: options.registry,
+    policy: options.policy ?? new AccessPolicy(),
   };
 }
 
 /**
- * Create the WorkspaceLens MCP server. Tools are registered by phase modules
- * so each capability stays independently testable.
+ * Create the WorkspaceLens MCP server. The tool list is the public contract
+ * surface: exactly the tools defined by `mcp-tools-spec.md`, no more.
  */
 export function createWorkspaceLensServer(context: ToolContext): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-  registerTools(server, context);
-  return server;
-}
 
-function registerTools(_server: McpServer, _context: ToolContext): void {
-  // Phase 4+ registers workspace_list, list_files, read_file, search_workspace,
-  // git_status, git_diff, and workspace_info here.
+  const tools = [workspaceListTool, listFilesTool, readFileTool] as const;
+  for (const tool of tools) {
+    server.registerTool(
+      tool.name,
+      { description: tool.description, inputSchema: tool.inputSchema },
+      createToolHandler(tool, context),
+    );
+  }
+  return server;
 }
