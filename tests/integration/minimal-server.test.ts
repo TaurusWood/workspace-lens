@@ -38,7 +38,10 @@ describe("WorkspaceLens MCP server", () => {
     const tools = await client.listTools();
     const names = tools.tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
+      "git_commit",
+      "git_compare",
       "git_diff",
+      "git_history",
       "git_status",
       "list_files",
       "read_file",

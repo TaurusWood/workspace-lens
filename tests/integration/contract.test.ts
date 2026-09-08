@@ -107,10 +107,13 @@ describe("MCP contract suite", () => {
   // Tool surface
   // ---------------------------------------------------------------------
 
-  it("exposes exactly the seven MVP tools with strict schemas and safe descriptions", async () => {
+  it("exposes exactly the v0.2 tool surface with strict schemas and safe descriptions", async () => {
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
+      "git_commit",
+      "git_compare",
       "git_diff",
+      "git_history",
       "git_status",
       "list_files",
       "read_file",
@@ -125,7 +128,16 @@ describe("MCP contract suite", () => {
       expect(tool.description).toBeTruthy();
       expect(tool.description).not.toMatch(/chatgpt|codex|openai|tunnel/i);
     }
-    for (const contentTool of ["list_files", "read_file", "search_workspace", "git_diff", "git_status"]) {
+    for (const contentTool of [
+      "list_files",
+      "read_file",
+      "search_workspace",
+      "git_diff",
+      "git_status",
+      "git_history",
+      "git_commit",
+      "git_compare",
+    ]) {
       const tool = tools.tools.find((candidate) => candidate.name === contentTool)!;
       expect(tool.description).toContain("untrusted data");
     }
@@ -154,7 +166,19 @@ describe("MCP contract suite", () => {
       args: ["x"],
       shell: "/bin/sh",
     };
-    for (const tool of ["workspace_list", "workspace_info", "list_files", "read_file", "search_workspace", "git_status", "git_diff"]) {
+    const allTools = [
+      "workspace_list",
+      "workspace_info",
+      "list_files",
+      "read_file",
+      "search_workspace",
+      "git_status",
+      "git_diff",
+      "git_history",
+      "git_commit",
+      "git_compare",
+    ];
+    for (const tool of allTools) {
       const minimal: Record<string, unknown> =
         tool === "workspace_list" ? {} : { workspace_id: "git-project" };
       const result = await call(tool, { ...minimal, ...mutationProps });

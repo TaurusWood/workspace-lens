@@ -6,7 +6,10 @@ import type { WorkspaceRegistry } from "../core/workspace-registry.js";
 import { SERVER_NAME, SERVER_VERSION } from "../version.js";
 import type { ToolContext } from "./context.js";
 import { createToolHandler } from "./tool-runner.js";
+import { gitCompareTool } from "./tools/git-compare.js";
+import { gitCommitTool } from "./tools/git-commit.js";
 import { gitDiffTool } from "./tools/git-diff.js";
+import { gitHistoryTool } from "./tools/git-history.js";
 import { gitStatusTool } from "./tools/git-status.js";
 import { listFilesTool } from "./tools/list-files.js";
 import { readFileTool } from "./tools/read-file.js";
@@ -46,6 +49,9 @@ export function createWorkspaceLensServer(context: ToolContext): McpServer {
     searchWorkspaceTool,
     gitStatusTool,
     gitDiffTool,
+    gitHistoryTool,
+    gitCommitTool,
+    gitCompareTool,
   ] as const;
   for (const tool of tools) {
     server.registerTool(

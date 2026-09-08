@@ -47,3 +47,29 @@ export const gitDiffSchema = z.strictObject({
   scope: z.enum(["unstaged", "staged", "all"]).optional(),
   path: z.string().min(1).max(4096).optional(),
 });
+
+/**
+ * Restricted commitish (`v0.2-mcp-tools-contract.md` §2). Length/shape bounds
+ * live here; the semantic grammar (no `~ ^ : @`, no ranges, no option-like
+ * values) is enforced by `validateRevisionInput` in the tool handler before
+ * any Git operation, so violations surface as `INVALID_ARGUMENT`.
+ */
+export const revisionSchema = z.string().min(1).max(200);
+
+export const gitHistorySchema = z.strictObject({
+  workspace_id: workspaceIdSchema,
+  start: revisionSchema.optional(),
+  max_commits: z.number().int().min(1).max(DEFAULT_LIMITS.maxGitHistoryCommits).optional(),
+});
+
+export const gitCommitSchema = z.strictObject({
+  workspace_id: workspaceIdSchema,
+  revision: revisionSchema,
+});
+
+export const gitCompareSchema = z.strictObject({
+  workspace_id: workspaceIdSchema,
+  base: revisionSchema,
+  head: revisionSchema.optional(),
+  mode: z.enum(["direct", "merge_base"]).optional(),
+});

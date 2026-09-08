@@ -29,7 +29,7 @@ export function describeToolError(thrown: unknown): string {
 
 function countResults(data: unknown): number | undefined {
   if (typeof data !== "object" || data === null) return undefined;
-  for (const key of ["workspaces", "entries", "matches", "sections"]) {
+  for (const key of ["workspaces", "entries", "matches", "sections", "commits"]) {
     const value = (data as Record<string, unknown>)[key];
     if (Array.isArray(value)) return value.length;
   }

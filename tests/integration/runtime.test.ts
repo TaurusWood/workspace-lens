@@ -75,7 +75,7 @@ describe("serve runtime lifecycle (built CLI)", () => {
         await client.connect(transport);
 
         const tools = await client.listTools();
-        expect(tools.tools).toHaveLength(7);
+        expect(tools.tools).toHaveLength(10);
 
         const list = (await client.callTool({
           name: "workspace_list",
