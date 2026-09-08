@@ -44,6 +44,9 @@ The project intentionally does **not** aim to become a coding agent.
 | `search_workspace` | Search code and text content |
 | `git_status` | Inspect working tree status |
 | `git_diff` | Review local uncommitted changes |
+| `git_history` | List recent local commit metadata |
+| `git_commit` | Inspect one local commit against its first parent |
+| `git_compare` | Compare two committed revisions (direct or merge-base) |
 
 ## Installation
 
@@ -61,32 +64,20 @@ npm run build
 npm link          # optional: puts the `workspace-lens` binary on your PATH
 ```
 
-## Quick Start
+## Setup
+
+The canonical setup guide is [`docs/getting-started.md`](docs/getting-started.md). It walks the real, verified path — install → authorize a workspace → doctor → (optional) OpenAI Secure MCP Tunnel → start the tunnel process → configure ChatGPT → first `workspace_list` → first review — and labels which steps belong to WorkspaceLens, the OpenAI Platform, and ChatGPT.
+
+Minimal stdio-only start:
 
 ```bash
-# 1. Authorize one or more workspace roots (local configuration only)
+npm install && npm run build && npm link
 workspace-lens add ~/code/my-project --name "My Project"
-workspace-lens list
-
-# 2. Check local prerequisites
 workspace-lens doctor
-
-# 3. Serve the MCP server on stdio
-workspace-lens serve
+workspace-lens serve   # speak MCP over stdio; your MCP client can also spawn this itself
 ```
 
-`serve` runs in the foreground and speaks MCP over stdio. Any MCP client that can launch a stdio server can use it, for example:
-
-```json
-{
-  "mcpServers": {
-    "workspace-lens": {
-      "command": "workspace-lens",
-      "args": ["serve"]
-    }
-  }
-}
-```
+Do not create a second setup guide: update `docs/getting-started.md` instead, so the documented path and the real path cannot drift apart.
 
 Then ask your reviewer chat:
 
@@ -95,7 +86,7 @@ Review the current uncommitted changes in my-project.
 Focus on architecture risks and potential bugs.
 ```
 
-The reviewer can discover context on its own via `workspace_list` → `git_status` → `git_diff` → `search_workspace` → `read_file`. There is no per-review initialization step; the workspace itself is the shared state.
+The reviewer can discover context on its own via `workspace_list` → `git_status` → `git_diff` → `search_workspace` → `read_file`. For committed local work it can use `git_history` → `git_commit` → `git_compare(base, HEAD)`; local-only unpushed commits require no GitHub. There is no per-review initialization step; the workspace itself is the shared state.
 
 ### Configuration
 
@@ -131,37 +122,17 @@ Blocked by default:
 - dependency directories such as `node_modules`
 - generated build artifacts
 
-Workspace access is limited to explicitly configured workspace roots. All paths are workspace-relative; canonical containment is verified with real-path resolution, so absolute paths, `..` traversal, and escaping symlinks are rejected. Blocked content cannot leak across `read_file`, `list_files`, `search_workspace`, `git_status`, or `git_diff` — they all share one AccessPolicy.
+Workspace access is limited to explicitly configured workspace roots. All paths are workspace-relative; canonical containment is verified with real-path resolution, so absolute paths, `..` traversal, and escaping symlinks are rejected. Blocked content cannot leak across `read_file`, `list_files`, `search_workspace`, `git_status`, `git_diff`, `git_history`, `git_commit`, or `git_compare` — they all share one AccessPolicy, and it applies to Git history too: a secret that only existed in an old commit cannot be read through `git_commit` or `git_compare`.
 
-WorkspaceLens cannot modify files, execute commands, or run arbitrary Git/search arguments. Workspace content is returned as untrusted data.
+WorkspaceLens cannot modify files, execute commands, or run arbitrary Git/search arguments. Public revisions are restricted commitishes (branch, tag, SHA, `HEAD`) — no ranges, ancestry syntax, or option-like values — and every revision is resolved to a concrete commit SHA through fixed internal Git templates before use. Workspace content is returned as untrusted data.
 
 ## ChatGPT Connection
 
-ChatGPT cannot reach `localhost` directly. The supported path is the official OpenAI **Secure MCP Tunnel** with `tunnel-client`. Gate 0 validation passed on the development environment: a real ChatGPT conversation discovered and repeatedly called the connection-test tool through the tunnel, recovered after a daemon restart, and honestly surfaced the stopped-service failure.
-
-Prerequisites (OpenAI-side, require your accounts):
-
-1. An OpenAI Platform organization with **Tunnels** permission (`Read + Use` to run, `Read + Manage` to create); create a tunnel at `platform.openai.com/settings/organization/tunnels` to obtain a `tunnel_id`.
-2. A runtime API key (`CONTROL_PLANE_API_KEY`).
-3. The official client from `github.com/openai/tunnel-client/releases/latest`.
-4. ChatGPT **developer mode** enabled for your workspace (Business/Enterprise/Edu; Pro supports read/fetch connectors).
-
-Product setup:
-
-```bash
-npm run build
-workspace-lens add /path/to/your/project
-export CONTROL_PLANE_API_KEY="<runtime key>"
-workspace-lens connect chatgpt --tunnel-id <your-tunnel-id>   # creates the profile via official init
-workspace-lens connect chatgpt                                 # re-check + print next steps
-tunnel-client run --profile workspace-lens                     # keep the tunnel alive
-```
-
-Then in ChatGPT: create a developer-mode app, pick **Tunnel** under Connection, select your tunnel, and call `workspace_list` from a real chat.
+ChatGPT cannot reach `localhost` directly. The supported path is the official OpenAI **Secure MCP Tunnel** with `tunnel-client`; it requires an OpenAI Platform tunnel, a runtime API key, and ChatGPT developer mode. The full verified walkthrough lives in [`docs/getting-started.md`](docs/getting-started.md) — do not duplicate it here.
 
 ## Status
 
-`v0.1` phases 1–10 of `docs/implementation-plan.md` are implemented and covered by automated suites (typecheck + 215 tests):
+`v0.2` adds local committed-state review (`git_history`, `git_commit`, `git_compare`) so a reviewer can inspect local-only unpushed commits and a trusted-base-to-head range without GitHub, plus a canonical setup guide. v0.1 phases 1–11 of `docs/implementation-plan.md` (through real end-to-end ChatGPT validation) and the v0.2 contracts are implemented and covered by automated suites:
 
 ```bash
 npm run typecheck
@@ -180,6 +151,7 @@ Recorded UX observations (`implementation-plan.md` §18; noted, not fixed):
 
 See:
 
+- [Getting Started](docs/getting-started.md) — the canonical setup guide
 - [Product Experience](docs/product-experience.md)
 - [Security Model](docs/security-model.md)
 - [MCP Tools Specification](docs/mcp-tools-spec.md)
