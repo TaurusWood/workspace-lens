@@ -106,6 +106,181 @@ export async function isGitRepository(cwd: string): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
+// v0.2 restricted commitish grammar (v0.2-mcp-tools-contract.md §2)
+// ---------------------------------------------------------------------------
+
+const REVISION_MAX_LENGTH = 200;
+// ASCII letters, digits, `.`, `_`, `/`, `-`. This class alone already rejects
+// `~`, `^`, `:`, `@`, backslash, whitespace, shell metacharacters, and control
+// characters, so ranges, `@{...}`, `:path`, and option-like values never
+// survive validation.
+const REVISION_CHARSET = /^[A-Za-z0-9._/-]+$/;
+const COMMIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Validate a public revision field against the restricted commitish grammar
+ * before any Git operation receives the value. Only plain commitishes
+ * (HEAD, branch, tag, SHA) survive; the caller's string is data, never a
+ * revision expression (`v0.2-security-contract.md` §4).
+ */
+export function validateRevisionInput(input: string): string {
+  if (input.length === 0 || input.length > REVISION_MAX_LENGTH) {
+    throw new AppError("INVALID_ARGUMENT", "Revision must be 1..200 characters long.");
+  }
+  if (!REVISION_CHARSET.test(input)) {
+    throw new AppError(
+      "INVALID_ARGUMENT",
+      "Revision contains characters outside the allowed commitish grammar.",
+    );
+  }
+  if (input.startsWith("-")) {
+    throw new AppError("INVALID_ARGUMENT", "Revision must not start with '-'.");
+  }
+  if (input.includes("..")) {
+    throw new AppError("INVALID_ARGUMENT", "Revision must not contain '..'.");
+  }
+  if (input.includes("//")) {
+    throw new AppError("INVALID_ARGUMENT", "Revision must not contain '//'.");
+  }
+  if (input.endsWith("/")) {
+    throw new AppError("INVALID_ARGUMENT", "Revision must not end with '/'.");
+  }
+  if (input.endsWith(".lock")) {
+    throw new AppError("INVALID_ARGUMENT", "Revision must not end with '.lock'.");
+  }
+  return input;
+}
+
+function revisionNotFound(): AppError {
+  return new AppError("GIT_REVISION_NOT_FOUND", "The revision did not resolve to a commit.");
+}
+
+/**
+ * Resolve a validated commitish to exactly one full commit SHA through the
+ * fixed `rev-parse --verify <input>^{commit}` template. `^{commit}` is
+ * template syntax, not caller input: it forces a commit object and peels
+ * annotated tags to their target commit.
+ */
+async function resolveCommitSha(toplevel: string, validated: string): Promise<string> {
+  const result = await runGit(toplevel, ["rev-parse", "--verify", `${validated}^{commit}`]);
+  if (result.code !== 0) {
+    if (/unknown revision|bad revision|ambiguous|needed a single revision|not a commit/i.test(
+      result.stderr,
+    )) {
+      throw revisionNotFound();
+    }
+    throw new AppError("GIT_OPERATION_FAILED", "The revision could not be resolved.");
+  }
+  const sha = result.stdout.trim();
+  if (!COMMIT_SHA.test(sha)) {
+    throw new AppError("GIT_OPERATION_FAILED", "The revision did not resolve to a commit.");
+  }
+  return sha;
+}
+
+/** Merge base of two resolved commit SHAs; Git exits 1 for unrelated histories. */
+async function resolveMergeBaseSha(
+  toplevel: string,
+  baseSha: string,
+  headSha: string,
+): Promise<string> {
+  const result = await runGit(toplevel, ["merge-base", baseSha, headSha]);
+  const sha = result.stdout.trim();
+  if (result.code === 0 && COMMIT_SHA.test(sha)) {
+    return sha;
+  }
+  if (result.code === 1) {
+    throw new AppError("GIT_NO_MERGE_BASE", "The two revisions have no common merge base.");
+  }
+  throw new AppError("GIT_OPERATION_FAILED", "The merge base could not be resolved.");
+}
+
+// Git hardcodes the empty tree object in every repository, so root-commit
+// comparisons never need to create or read a real object.
+const EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const EMPTY_TREE_SHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
+
+/** Empty-tree object id for the repository's object format (root-commit base). */
+async function resolveEmptyTreeSha(toplevel: string): Promise<string> {
+  const result = await runGit(toplevel, ["rev-parse", "--show-object-format"]);
+  if (result.code !== 0) {
+    throw new AppError("GIT_OPERATION_FAILED", "The repository object format could not be read.");
+  }
+  switch (result.stdout.trim()) {
+    case "sha1":
+      return EMPTY_TREE_SHA1;
+    case "sha256":
+      return EMPTY_TREE_SHA256;
+    default:
+      throw new AppError("GIT_OPERATION_FAILED", "Unsupported repository object format.");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Commit metadata parsing (v0.2-requirements.md §3.1/§3.2: metadata only)
+// ---------------------------------------------------------------------------
+
+/** %H %P %an %cI %s — \x01-separated fields inside a NUL-separated record. */
+const COMMIT_FORMAT = "%H%x01%P%x01%an%x01%cI%x01%s";
+
+interface CommitMetadata {
+  commit: string;
+  parents: string[];
+  subject: string;
+  author_name: string;
+  committed_at: string;
+}
+
+/** Strict ISO-8601 UTC (`2026-09-05T12:34:56Z`), locale-independent. */
+function normalizeCommitTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError("GIT_OPERATION_FAILED", "The commit timestamp could not be parsed.");
+  }
+  return parsed.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function parseCommitRecord(record: string): CommitMetadata {
+  const fields = record.split("\x01");
+  if (fields.length < 5 || !COMMIT_SHA.test(fields[0]!)) {
+    throw new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be parsed.");
+  }
+  return {
+    commit: fields[0]!,
+    parents: fields[1] === "" ? [] : fields[1]!.split(" "),
+    author_name: fields[2]!,
+    committed_at: normalizeCommitTimestamp(fields[3]!),
+    // A subject may itself contain \x01 bytes; keep them in the subject.
+    subject: fields.slice(4).join("\x01"),
+  };
+}
+
+async function readCommitLog(
+  toplevel: string,
+  startSha: string,
+  maxCount: number,
+): Promise<CommitMetadata[]> {
+  const result = await runGit(toplevel, [
+    "log",
+    "-z",
+    "--no-color",
+    `--format=${COMMIT_FORMAT}`,
+    "-n",
+    String(maxCount),
+    startSha,
+  ]);
+  if (result.code !== 0) {
+    throw new AppError("GIT_OPERATION_FAILED", "Commit history could not be read.");
+  }
+  const commits: CommitMetadata[] = [];
+  for (const record of result.stdout.split("\x00")) {
+    if (record === "") continue;
+    commits.push(parseCommitRecord(record));
+  }
+  return commits;
+}
+
+// ---------------------------------------------------------------------------
 // Structured results (mcp-tools-spec.md §11/§12)
 // ---------------------------------------------------------------------------
 
@@ -154,6 +329,56 @@ export interface GitDiffResult {
   scope: DiffScope;
   sections: DiffSection[];
   redacted_files: number;
+  truncated: boolean;
+}
+
+export interface GitHistoryCommit {
+  commit: string;
+  parents: string[];
+  subject: string;
+  author_name: string;
+  committed_at: string;
+}
+
+export interface GitHistoryResult {
+  /** Resolved full commit SHA of the start revision. */
+  start: string;
+  commits: GitHistoryCommit[];
+  truncated: boolean;
+}
+
+export interface GitCommitResult {
+  commit: string;
+  parents: string[];
+  subject: string;
+  author_name: string;
+  committed_at: string;
+  /** First parent SHA, or null for a root commit (empty-tree comparison). */
+  comparison_base: string | null;
+  files_changed: number;
+  redacted_files: number;
+  diff: string;
+  truncated: boolean;
+}
+
+export type GitCompareMode = "direct" | "merge_base";
+
+/** Internal shape shared by `git_commit` and `git_compare` diff output. */
+interface CommittedDiffResult {
+  diff: string;
+  files_changed: number;
+  redacted_files: number;
+  truncated: boolean;
+}
+
+export interface GitCompareResult {
+  mode: GitCompareMode;
+  requested_base: string;
+  head: string;
+  comparison_base: string;
+  files_changed: number;
+  redacted_files: number;
+  diff: string;
   truncated: boolean;
 }
 
@@ -608,6 +833,207 @@ export class GitAdapter {
       }
 
       return { scope, sections, redacted_files: redactedFiles, truncated };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // v0.2 committed-state inspection (v0.2-mcp-tools-contract.md §4-§7)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Bounded, policy-filtered unified diff between two committed tree states.
+   * Same defense strategy as working-tree diffs (`v0.2-security-contract.md`
+   * §3): list changed paths through a fixed machine-readable operation,
+   * classify every old/new path through the AccessPolicy, request diff
+   * bodies only for allowed pathspecs, re-filter sections, apply the central
+   * byte budget.
+   *
+   * With `--relative`, Git itself scopes output to the workspace subtree and
+   * emits workspace-relative paths, so repository paths outside an
+   * authorized workspace subdirectory never reach this code at all, and a
+   * cross-boundary rename collapses to the add/delete of the inside path.
+   * Blocked (sensitive) paths inside the workspace are redacted with only a
+   * count returned.
+   */
+  private async committedDiff(
+    context: RepoContext,
+    baseSha: string,
+    headSha: string,
+  ): Promise<CommittedDiffResult> {
+    const relativeArg =
+      context.prefix === "" ? [] : [`--relative=${context.prefix.replace(/\/+$/, "")}`];
+
+    const listing = await runGit(context.toplevel, [
+      "diff",
+      ...relativeArg,
+      "--name-status",
+      "-z",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      baseSha,
+      headSha,
+    ]);
+    if (listing.code !== 0) {
+      throw new AppError("GIT_OPERATION_FAILED", "Git diff paths could not be listed.");
+    }
+
+    // Listing paths are workspace-relative (--relative output, or a root
+    // workspace where repository-relative and workspace-relative coincide).
+    const pathspecs: string[] = [];
+    let redacted = 0;
+    for (const entry of parseNameStatus(listing.stdout)) {
+      let blocked = false;
+      for (const workspacePath of entry.paths) {
+        if (!this.policy.isAllowed(workspacePath)) {
+          blocked = true;
+          break;
+        }
+      }
+      if (blocked) {
+        redacted += 1;
+        continue;
+      }
+      for (const workspacePath of entry.paths) {
+        pathspecs.push(`:(literal)${context.prefix}${workspacePath}`);
+      }
+    }
+
+    let text = "";
+    if (pathspecs.length > 0) {
+      const diffRun = await runGit(context.toplevel, [
+        "diff",
+        ...relativeArg,
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        baseSha,
+        headSha,
+        "--",
+        ...pathspecs,
+      ]);
+      if (diffRun.code !== 0) {
+        throw new AppError("GIT_OPERATION_FAILED", "Git diff could not be read.");
+      }
+      text = diffRun.stdout;
+    }
+
+    // Defense in depth: drop any file section whose header paths are
+    // policy-blocked (rename headers can otherwise mention blocked names).
+    const keptSections: string[] = [];
+    for (const section of splitDiffSections(text)) {
+      let blocked = false;
+      for (const workspacePath of extractDiffSectionPaths(section)) {
+        if (!this.policy.isAllowed(workspacePath)) {
+          blocked = true;
+          break;
+        }
+      }
+      if (blocked) {
+        redacted += 1;
+        continue;
+      }
+      keptSections.push(section);
+    }
+    text = keptSections.join("");
+
+    let truncated = false;
+    if (Buffer.byteLength(text, "utf8") > this.limits.maxDiffPayloadBytes) {
+      text = cutToByteBudget(text, this.limits.maxDiffPayloadBytes);
+      truncated = true;
+    }
+    return {
+      diff: text,
+      files_changed: countDiffFiles(text),
+      redacted_files: redacted,
+      truncated,
+    };
+  }
+
+  /**
+   * `git_history` (`v0.2-mcp-tools-contract.md` §4): bounded
+   * newest-to-oldest commit metadata from a validated, resolved start
+   * commit. Metadata only — no changed paths, bodies, or caller-controlled
+   * formatting.
+   */
+  async history(
+    root: string,
+    startRevision: string,
+    maxCommits: number,
+  ): Promise<GitHistoryResult> {
+    return this.requireGitOperation(async () => {
+      const validated = validateRevisionInput(startRevision);
+      const context = await this.resolveContext(root);
+      const start = await resolveCommitSha(context.toplevel, validated);
+      const bounded = Math.max(
+        1,
+        Math.min(Math.trunc(maxCommits), this.limits.maxGitHistoryCommits),
+      );
+      // One extra record powers the truncation flag without a second query.
+      const fetched = await readCommitLog(context.toplevel, start, bounded + 1);
+      return {
+        start,
+        commits: fetched.slice(0, bounded),
+        truncated: fetched.length > bounded,
+      };
+    });
+  }
+
+  /**
+   * `git_commit` (§5): one commit against its contract comparison base —
+   * the first parent, or the empty tree for a root commit. Merge commits are
+   * reviewed as first parent -> merge commit; no multi-parent analysis.
+   */
+  async commit(root: string, revision: string): Promise<GitCommitResult> {
+    return this.requireGitOperation(async () => {
+      const validated = validateRevisionInput(revision);
+      const context = await this.resolveContext(root);
+      const sha = await resolveCommitSha(context.toplevel, validated);
+      const [metadata] = await readCommitLog(context.toplevel, sha, 1);
+      if (metadata === undefined || metadata.commit !== sha) {
+        throw new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be read.");
+      }
+      if (metadata.parents.length === 0) {
+        const emptyTree = await resolveEmptyTreeSha(context.toplevel);
+        const diffResult = await this.committedDiff(context, emptyTree, sha);
+        return { ...metadata, comparison_base: null, ...diffResult };
+      }
+      const diffResult = await this.committedDiff(context, metadata.parents[0]!, sha);
+      return { ...metadata, comparison_base: metadata.parents[0]!, ...diffResult };
+    });
+  }
+
+  /**
+   * `git_compare` (§6): two validated, resolved committed revisions.
+   * `direct` compares base -> head; `merge_base` compares
+   * merge-base(base, head) -> head so feature-branch review excludes
+   * unrelated post-divergence base-branch commits. Working-tree state is
+   * never included.
+   */
+  async compare(
+    root: string,
+    baseRevision: string,
+    headRevision: string,
+    mode: GitCompareMode,
+  ): Promise<GitCompareResult> {
+    return this.requireGitOperation(async () => {
+      const validatedBase = validateRevisionInput(baseRevision);
+      const validatedHead = validateRevisionInput(headRevision);
+      const context = await this.resolveContext(root);
+      const requestedBase = await resolveCommitSha(context.toplevel, validatedBase);
+      const head = await resolveCommitSha(context.toplevel, validatedHead);
+      const comparisonBase =
+        mode === "merge_base"
+          ? await resolveMergeBaseSha(context.toplevel, requestedBase, head)
+          : requestedBase;
+      const diffResult = await this.committedDiff(context, comparisonBase, head);
+      return {
+        mode,
+        requested_base: requestedBase,
+        head,
+        comparison_base: comparisonBase,
+        ...diffResult,
+      };
     });
   }
 }

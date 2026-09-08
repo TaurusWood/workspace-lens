@@ -18,6 +18,8 @@ export const ERROR_CODES = [
   "FILE_TOO_LARGE",
   "NOT_A_GIT_REPOSITORY",
   "GIT_OPERATION_FAILED",
+  "GIT_REVISION_NOT_FOUND",
+  "GIT_NO_MERGE_BASE",
   "SEARCH_FAILED",
   "INTERNAL_ERROR",
 ] as const;
@@ -40,6 +42,8 @@ const RETRYABLE_BY_CODE: Record<ErrorCode, boolean> = {
   FILE_TOO_LARGE: false,
   NOT_A_GIT_REPOSITORY: false,
   GIT_OPERATION_FAILED: true,
+  GIT_REVISION_NOT_FOUND: false,
+  GIT_NO_MERGE_BASE: false,
   SEARCH_FAILED: true,
   INTERNAL_ERROR: true,
 };

@@ -26,8 +26,12 @@ describe("AppError", () => {
   });
 
   it("covers every documented error code", () => {
-    // mcp-tools-spec.md §4 defines exactly these codes.
-    expect(ERROR_CODES).toHaveLength(17);
+    // mcp-tools-spec.md §4 plus the v0.2 delta (v0.2-mcp-tools-contract.md §3).
+    expect(ERROR_CODES).toHaveLength(19);
+    expect(ERROR_CODES).toContain("GIT_REVISION_NOT_FOUND");
+    expect(ERROR_CODES).toContain("GIT_NO_MERGE_BASE");
+    expect(new AppError("GIT_REVISION_NOT_FOUND", "x").retryable).toBe(false);
+    expect(new AppError("GIT_NO_MERGE_BASE", "x").retryable).toBe(false);
   });
 });
 

@@ -21,6 +21,10 @@ export interface ServerLimits {
   defaultSearchResults: number;
   /** Hard byte ceiling for the combined `git_diff` payload. */
   maxDiffPayloadBytes: number;
+  /** Default commit count returned by `git_history` (v0.2-requirements.md §5). */
+  defaultGitHistoryCommits: number;
+  /** Hard server ceiling for the `git_history` commit count. */
+  maxGitHistoryCommits: number;
   /** Bounded length of a search preview line. */
   maxSearchPreviewChars: number;
   /** Maximum search query length. */
@@ -39,6 +43,8 @@ export const DEFAULT_LIMITS: ServerLimits = {
   maxSearchResults: 100,
   defaultSearchResults: 50,
   maxDiffPayloadBytes: 256 * 1024, // 256 KiB
+  defaultGitHistoryCommits: 20,
+  maxGitHistoryCommits: 100,
   maxSearchPreviewChars: 200,
   maxQueryLength: 500,
   maxSearchFileScan: 20000,
