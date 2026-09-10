@@ -13,7 +13,7 @@
  *   mapped back into the workspace and filtered through the AccessPolicy,
  *   so blocked paths never expose names or diff bodies.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { AppError } from "../core/errors.js";
@@ -33,6 +33,20 @@ const GIT_CONFIG_ARGS: readonly string[] = [
   "core.quotepath=false",
   "-c",
   "core.abbrev=12",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "log.showSignature=false",
+  "-c",
+  "core.hooksPath=",
+  "-c",
+  "diff.external=",
+  "-c",
+  "diff.textconv=",
+  "-c",
+  "diff.renames=true",
+  "-c",
+  "diff.renameLimit=10000",
 ];
 
 /** Environment hardening applied to every Git invocation. */
@@ -48,6 +62,10 @@ export interface GitRunResult {
   code: number;
   stdout: string;
   stderr: string;
+}
+
+export interface GitBoundedRunResult extends GitRunResult {
+  truncated: boolean;
 }
 
 export class GitSpawnError extends Error {
@@ -92,6 +110,87 @@ export function runGit(cwd: string, args: readonly string[]): Promise<GitRunResu
         });
       },
     );
+  });
+}
+
+/**
+ * Stream Git stdout with a strict byte ceiling. If stdout reaches byteLimit,
+ * the child process is terminated immediately with SIGTERM to prevent unbounded
+ * memory growth or Node maxBuffer exhaustion on multi-megabyte diffs.
+ */
+export function runGitBounded(
+  cwd: string,
+  args: readonly string[],
+  byteLimit: number,
+): Promise<GitBoundedRunResult> {
+  return new Promise((resolve, reject) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(GIT_EXECUTABLE, [...GIT_CONFIG_ARGS, ...args], {
+        cwd,
+        shell: false,
+        windowsHide: true,
+        env: { ...process.env, ...GIT_ENV_OVERRIDES },
+      });
+    } catch (error) {
+      reject(new GitSpawnError("Git executable is not available.", { cause: error }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let receivedBytes = 0;
+    let truncated = false;
+    let killedByLimit = false;
+
+    child.on("error", (error) => {
+      reject(new GitSpawnError("Git executable is not available.", { cause: error }));
+    });
+
+    if (child.stdout === null || child.stderr === null) {
+      reject(new GitSpawnError("Failed to open child process stdio pipes."));
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+    }, GIT_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (truncated) return;
+      chunks.push(chunk);
+      receivedBytes += chunk.length;
+      if (receivedBytes >= byteLimit) {
+        truncated = true;
+        killedByLimit = true;
+        child.kill("SIGTERM");
+      }
+    });
+
+    const stderrChunks: Buffer[] = [];
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrChunks.push(chunk);
+    });
+
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      const stdoutBuf = Buffer.concat(chunks);
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (killedByLimit) {
+        resolve({
+          code: 0,
+          stdout: stdoutBuf.toString("utf8"),
+          stderr,
+          truncated: true,
+        });
+        return;
+      }
+      resolve({
+        code: signal !== null ? -1 : typeof code === "number" ? code : -1,
+        stdout: stdoutBuf.toString("utf8"),
+        stderr,
+        truncated: false,
+      });
+    });
   });
 }
 
@@ -264,6 +363,7 @@ async function readCommitLog(
     "log",
     "-z",
     "--no-color",
+    "--no-show-signature",
     `--format=${COMMIT_FORMAT}`,
     "-n",
     String(maxCount),
@@ -475,6 +575,12 @@ function parseStatusEntries(zText: string): Array<{ x: string; y: string; paths:
   return entries;
 }
 
+export function assertReliableRenameDetection(stderr: string): void {
+  if (/rename detection was skipped/i.test(stderr)) {
+    throw new AppError("GIT_OPERATION_FAILED", "Rename detection could not be completed reliably.");
+  }
+}
+
 interface NameStatusEntry {
   code: string;
   paths: string[]; // [old, new] for renames/copies, else [path]
@@ -552,10 +658,6 @@ function cutToByteBudget(text: string, budget: number): string {
   const slice = buffer.subarray(0, end).toString("utf8");
   const lastNewline = slice.lastIndexOf("\n");
   return lastNewline > 0 ? slice.slice(0, lastNewline) : slice;
-}
-
-function countDiffFiles(text: string): number {
-  return (text.match(/^diff --git /gm) ?? []).length;
 }
 
 export class GitAdapter {
@@ -750,15 +852,27 @@ export class GitAdapter {
       let budget = this.limits.maxDiffPayloadBytes;
 
       for (const sectionScope of sectionScopes) {
-        const listingArgs = ["diff", "--name-status", "-z", "--no-color", "--no-ext-diff"];
+        const listingArgs = [
+          "diff",
+          "--name-status",
+          "-z",
+          "-M",
+          "-C",
+          "--find-copies-harder",
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+        ];
         if (sectionScope === "staged") listingArgs.push("--cached");
         if (filterRepoPath !== undefined) listingArgs.push("--", `:(literal)${filterRepoPath}`);
         const listing = await runGit(context.toplevel, listingArgs);
         if (listing.code !== 0) {
           throw new AppError("GIT_OPERATION_FAILED", "Git diff paths could not be listed.");
         }
+        assertReliableRenameDetection(listing.stderr);
 
         const allowedPathspecs: string[] = [];
+        let sectionAllowedFiles = 0;
         for (const entry of parseNameStatus(listing.stdout)) {
           let blocked = false;
           for (const repoPath of entry.paths) {
@@ -772,21 +886,33 @@ export class GitAdapter {
             redactedFiles += 1;
             continue;
           }
+          sectionAllowedFiles += 1;
           for (const repoPath of entry.paths) {
             allowedPathspecs.push(`:(literal)${repoPath}`);
           }
         }
 
         let text = "";
-        if (allowedPathspecs.length > 0) {
-          const diffArgs = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
+        let sectionTruncated = false;
+        if (allowedPathspecs.length > 0 && budget > 0) {
+          const diffArgs = [
+            "diff",
+            "-M",
+            "-C",
+            "--find-copies-harder",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+          ];
           if (sectionScope === "staged") diffArgs.push("--cached");
           diffArgs.push("--", ...allowedPathspecs);
-          const diffRun = await runGit(context.toplevel, diffArgs);
+          const diffRun = await runGitBounded(context.toplevel, diffArgs, budget);
           if (diffRun.code !== 0) {
             throw new AppError("GIT_OPERATION_FAILED", "Git diff could not be read.");
           }
+          assertReliableRenameDetection(diffRun.stderr);
           text = diffRun.stdout;
+          sectionTruncated = diffRun.truncated;
         }
 
         // Defense in depth: drop any file section whose header paths are
@@ -811,14 +937,14 @@ export class GitAdapter {
         text = keptSections.join("");
 
         const bytes = Buffer.byteLength(text, "utf8");
-        if (bytes > budget) {
+        if (sectionTruncated || bytes > budget) {
           text = cutToByteBudget(text, budget);
           truncated = true;
           budget = 0;
           sections.push({
             scope: sectionScope,
             diff: text,
-            files_changed: countDiffFiles(text),
+            files_changed: sectionAllowedFiles,
             truncated: true,
           });
           continue;
@@ -827,7 +953,7 @@ export class GitAdapter {
         sections.push({
           scope: sectionScope,
           diff: text,
-          files_changed: countDiffFiles(text),
+          files_changed: sectionAllowedFiles,
           truncated: false,
         });
       }
@@ -868,6 +994,9 @@ export class GitAdapter {
       ...relativeArg,
       "--name-status",
       "-z",
+      "-M",
+      "-C",
+      "--find-copies-harder",
       "--no-color",
       "--no-ext-diff",
       "--no-textconv",
@@ -877,11 +1006,13 @@ export class GitAdapter {
     if (listing.code !== 0) {
       throw new AppError("GIT_OPERATION_FAILED", "Git diff paths could not be listed.");
     }
+    assertReliableRenameDetection(listing.stderr);
 
     // Listing paths are workspace-relative (--relative output, or a root
     // workspace where repository-relative and workspace-relative coincide).
     const pathspecs: string[] = [];
     let redacted = 0;
+    let allowedFilesCount = 0;
     for (const entry of parseNameStatus(listing.stdout)) {
       let blocked = false;
       for (const workspacePath of entry.paths) {
@@ -894,28 +1025,39 @@ export class GitAdapter {
         redacted += 1;
         continue;
       }
+      allowedFilesCount += 1;
       for (const workspacePath of entry.paths) {
         pathspecs.push(`:(literal)${context.prefix}${workspacePath}`);
       }
     }
 
     let text = "";
+    let diffTruncated = false;
     if (pathspecs.length > 0) {
-      const diffRun = await runGit(context.toplevel, [
-        "diff",
-        ...relativeArg,
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        baseSha,
-        headSha,
-        "--",
-        ...pathspecs,
-      ]);
+      const diffRun = await runGitBounded(
+        context.toplevel,
+        [
+          "diff",
+          ...relativeArg,
+          "-M",
+          "-C",
+          "--find-copies-harder",
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+          baseSha,
+          headSha,
+          "--",
+          ...pathspecs,
+        ],
+        this.limits.maxDiffPayloadBytes,
+      );
       if (diffRun.code !== 0) {
         throw new AppError("GIT_OPERATION_FAILED", "Git diff could not be read.");
       }
+      assertReliableRenameDetection(diffRun.stderr);
       text = diffRun.stdout;
+      diffTruncated = diffRun.truncated;
     }
 
     // Defense in depth: drop any file section whose header paths are
@@ -937,14 +1079,14 @@ export class GitAdapter {
     }
     text = keptSections.join("");
 
-    let truncated = false;
-    if (Buffer.byteLength(text, "utf8") > this.limits.maxDiffPayloadBytes) {
+    let truncated = diffTruncated;
+    if (truncated || Buffer.byteLength(text, "utf8") > this.limits.maxDiffPayloadBytes) {
       text = cutToByteBudget(text, this.limits.maxDiffPayloadBytes);
       truncated = true;
     }
     return {
       diff: text,
-      files_changed: countDiffFiles(text),
+      files_changed: allowedFilesCount,
       redacted_files: redacted,
       truncated,
     };
@@ -1059,6 +1201,10 @@ function extractDiffSectionPaths(section: string): string[] {
     const renameTo = line.match(/^rename to (.+)$/);
     if (renameFrom !== null) paths.push(unquoteGitPath(renameFrom[1]!));
     if (renameTo !== null) paths.push(unquoteGitPath(renameTo[1]!));
+    const copyFrom = line.match(/^copy from (.+)$/);
+    const copyTo = line.match(/^copy to (.+)$/);
+    if (copyFrom !== null) paths.push(unquoteGitPath(copyFrom[1]!));
+    if (copyTo !== null) paths.push(unquoteGitPath(copyTo[1]!));
   }
   return paths.filter((entry) => entry !== "");
 }

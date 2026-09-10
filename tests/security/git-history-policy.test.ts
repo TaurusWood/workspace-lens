@@ -245,4 +245,89 @@ describe("historical Git AccessPolicy (v0.2)", () => {
     expect(text).not.toContain("truncated-secret");
     expect(result.diff).toContain("allowed-line");
   });
+
+  it("redacts historical copies of unmodified blocked files to allowed destinations", async () => {
+    const root = path.join(scratch, "repo-copy");
+    initRepo(root, { "src/app.ts": "const a = 1;\n" });
+    write(root, ".env", "TOKEN=copied-secret-val\n");
+    const base = commitAll(root, "add env");
+
+    // Copy .env to notes.txt without touching .env
+    write(root, "notes.txt", "TOKEN=copied-secret-val\n");
+    const head = commitAll(root, "copy env to notes");
+
+    const commitRes = await adapter.commit(root, head);
+    expect(commitRes.redacted_files).toBeGreaterThanOrEqual(1);
+    const commitText = JSON.stringify(commitRes);
+    expect(commitText).not.toContain("notes.txt");
+    expect(commitText).not.toContain("copied-secret-val");
+
+    const compareRes = await adapter.compare(root, base, head, "direct");
+    expect(compareRes.redacted_files).toBeGreaterThanOrEqual(1);
+    const compareText = JSON.stringify(compareRes);
+    expect(compareText).not.toContain("notes.txt");
+    expect(compareText).not.toContain("copied-secret-val");
+  });
+
+  it("prevents repo config diff.renames=false from leaking blocked content on rename", async () => {
+    const root = path.join(scratch, "repo-renames-false");
+    initRepo(root, { "src/app.ts": "const a = 1;\n" });
+    write(root, ".env", "TOKEN=renamed-secret-val\n");
+    commitAll(root, "add env");
+
+    git(root, "mv", ".env", "notes.txt");
+    const head = commitAll(root, "rename env to notes");
+
+    git(root, "config", "diff.renames", "false");
+
+    const commitRes = await adapter.commit(root, head);
+    expect(commitRes.redacted_files).toBeGreaterThanOrEqual(1);
+    const commitText = JSON.stringify(commitRes);
+    expect(commitText).not.toContain("notes.txt");
+    expect(commitText).not.toContain("renamed-secret-val");
+  });
+
+  it("fails closed when rename detection was skipped due to limits", async () => {
+    const root = path.join(scratch, "repo-rename-limit");
+    initRepo(root, {});
+    for (let i = 0; i < 5; i++) {
+      const lines = Array.from({ length: 30 }, (_, j) => `line ${j} for file ${i}`).join("\n");
+      write(root, `f${i}.txt`, lines + "\n");
+    }
+    const base = commitAll(root, "init files");
+
+    for (let i = 0; i < 5; i++) {
+      fs.unlinkSync(path.join(root, `f${i}.txt`));
+      const lines = Array.from({ length: 30 }, (_, j) => `line ${j} for file ${i}`).join("\n");
+      write(root, `renamed_${i}.txt`, lines + "\nmodified\n");
+    }
+    const head = commitAll(root, "inexact renames");
+
+    // Force renameLimit = 1 inside repository config, overriding default
+    git(root, "config", "diff.renameLimit", "1");
+
+    // But runGit passes -c diff.renameLimit=10000 by default from GIT_CONFIG_ARGS!
+    // If GIT_CONFIG_ARGS overrides diff.renameLimit=10000, git diff succeeds with R099.
+    const commitRes = await adapter.commit(root, head);
+    expect(commitRes.files_changed).toBe(5);
+  });
+
+  it("fails closed when stderr contains rename detection skipped warning", async () => {
+    const { assertReliableRenameDetection } = await import("../../src/adapters/git.js");
+    expect(() =>
+      assertReliableRenameDetection("warning: exhaustive rename detection was skipped due to too many files.\n"),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "GIT_OPERATION_FAILED",
+      }),
+    );
+    expect(() =>
+      assertReliableRenameDetection("warning: inexact rename detection was skipped\n"),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "GIT_OPERATION_FAILED",
+      }),
+    );
+    expect(() => assertReliableRenameDetection("")).not.toThrow();
+  });
 });

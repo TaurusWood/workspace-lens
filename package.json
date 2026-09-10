@@ -1,6 +1,6 @@
 {
   "name": "workspace-lens",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A secure, read-only MCP context server for explicitly authorized local development workspaces.",
   "type": "module",
   "license": "MIT",

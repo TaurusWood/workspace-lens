@@ -347,8 +347,55 @@ describe("GitAdapter historical primitives (v0.2)", () => {
       });
       const result = await tiny.commit(root, sha);
       expect(result.truncated).toBe(true);
+      expect(result.files_changed).toBe(1);
       expect(Buffer.byteLength(result.diff, "utf8")).toBeLessThanOrEqual(500);
       expect(result.diff).toContain("a.txt");
+    });
+
+    it("preserves accurate files_changed count when commit and compare diff payloads are truncated across multiple files", async () => {
+      const root = path.join(scratch, "multi-trunc-hist");
+      const files: Record<string, string> = {};
+      for (let i = 0; i < 8; i++) files[`f${i}.txt`] = `init ${i}\n`;
+      initRepo(root, files);
+      const base = revParse(root, "HEAD");
+
+      for (let i = 0; i < 8; i++) write(root, `f${i}.txt`, `${"extended content\n".repeat(40)}`);
+      const head = commitAll(root, "modify all 8 files");
+
+      const tiny = new GitAdapter({
+        limits: { ...DEFAULT_LIMITS, maxDiffPayloadBytes: 250 },
+        policy: new AccessPolicy(),
+      });
+
+      const commitRes = await tiny.commit(root, head);
+      expect(commitRes.truncated).toBe(true);
+      expect(commitRes.files_changed).toBe(8);
+
+      const compareRes = await tiny.compare(root, base, head, "direct");
+      expect(compareRes.truncated).toBe(true);
+      expect(compareRes.files_changed).toBe(8);
+    });
+
+    it("gracefully truncates diffs exceeding the 32 MiB maxBuffer ceiling without error", async () => {
+      const root = path.join(scratch, "huge-diff");
+      initRepo(root, { "big.txt": "0\n" });
+      const base = revParse(root, "HEAD");
+
+      // 34 MiB change exceeds the 32 MiB maxBuffer
+      const buf = Buffer.alloc(34 * 1024 * 1024, "x\n");
+      fs.writeFileSync(path.join(root, "big.txt"), buf);
+      const head = commitAll(root, "34 MiB change");
+
+      const result = await adapter.commit(root, head);
+      expect(result.truncated).toBe(true);
+      expect(result.files_changed).toBe(1);
+      expect(Buffer.byteLength(result.diff, "utf8")).toBeLessThanOrEqual(DEFAULT_LIMITS.maxDiffPayloadBytes);
+      expect(result.diff.length).toBeGreaterThan(0);
+
+      const compareResult = await adapter.compare(root, base, head, "direct");
+      expect(compareResult.truncated).toBe(true);
+      expect(compareResult.files_changed).toBe(1);
+      expect(Buffer.byteLength(compareResult.diff, "utf8")).toBeLessThanOrEqual(DEFAULT_LIMITS.maxDiffPayloadBytes);
     });
 
     it("prevents repository-local config from executing external diff or textconv", async () => {
@@ -495,6 +542,47 @@ describe("GitAdapter historical primitives (v0.2)", () => {
       const result = await adapter.compare(root, baseTip, headTip, "merge_base");
       expect(result.head).toBe(headTip);
       expect(result.diff).toContain("feature.ts");
+    });
+
+    it("prevents repository-local log.showSignature and gpg.program from executing external scripts", async () => {
+      const { execFileSync } = await import("node:child_process");
+      const root = path.join(scratch, "repo-sig");
+      initRepo(root, { "file.txt": "hello\n" });
+      const tree = git(root, "write-tree").trim();
+      const commitData = `tree ${tree}
+author Test <test@example.com> 1600000000 +0000
+committer Test <test@example.com> 1600000000 +0000
+gpgsig -----BEGIN PGP SIGNATURE-----
+ Version: GnuPG
+ dummy
+ -----END PGP SIGNATURE-----
+
+signed commit
+`;
+      const commitSha = execFileSync(
+        "git",
+        ["hash-object", "-t", "commit", "-w", "--stdin"],
+        { cwd: root, input: commitData, encoding: "utf8" },
+      ).trim();
+      git(root, "update-ref", "refs/heads/main", commitSha);
+
+      const marker = path.join(scratch, "gpg-marker.txt");
+      const script = path.join(scratch, "gpg-stub.sh");
+      fs.writeFileSync(
+        script,
+        `#!/bin/sh\ntouch "${marker}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      git(root, "config", "log.showSignature", "true");
+      git(root, "config", "gpg.program", script);
+
+      const historyResult = await adapter.history(root, "main", 10);
+      expect(historyResult.commits.length).toBeGreaterThan(0);
+      expect(fs.existsSync(marker)).toBe(false);
+
+      const commitResult = await adapter.commit(root, commitSha);
+      expect(commitResult.commit).toBe(commitSha);
+      expect(fs.existsSync(marker)).toBe(false);
     });
   });
 });

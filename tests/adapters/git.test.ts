@@ -255,9 +255,42 @@ describe("GitAdapter", () => {
       });
       const result = await tiny.diff(bigRoot, "unstaged");
       expect(result.truncated).toBe(true);
+      expect(result.sections[0]!.files_changed).toBe(2);
       const total = result.sections.reduce((sum, section) => sum + section.diff.length, 0);
       expect(Buffer.byteLength(result.sections.map((s) => s.diff).join(""), "utf8")).toBeLessThanOrEqual(500);
       expect(total).toBeGreaterThan(0);
+    });
+
+    it("preserves policy-allowed files_changed count across many files when diff payload is truncated", async () => {
+      const multiRoot = path.join(scratch, "multi-trunc");
+      const initial: Record<string, string> = {};
+      for (let i = 0; i < 10; i++) {
+        initial[`file-${i}.txt`] = `line-1\nline-2\nline-3\n`;
+      }
+      initRepo(multiRoot, initial);
+      for (let i = 0; i < 10; i++) {
+        write(multiRoot, `file-${i}.txt`, `${"big-change-line\n".repeat(50)}`);
+      }
+
+      const tiny = new GitAdapter({
+        limits: { ...DEFAULT_LIMITS, maxDiffPayloadBytes: 200 },
+        policy: new AccessPolicy(),
+      });
+      const result = await tiny.diff(multiRoot, "unstaged");
+      expect(result.truncated).toBe(true);
+      expect(result.sections[0]!.files_changed).toBe(10);
+    });
+
+    it("gracefully truncates working-tree diffs exceeding 32 MiB maxBuffer ceiling without error", async () => {
+      const hugeRoot = path.join(scratch, "huge-working-tree");
+      initRepo(hugeRoot, { "big.txt": "0\n" });
+      const buf = Buffer.alloc(34 * 1024 * 1024, "w\n");
+      fs.writeFileSync(path.join(hugeRoot, "big.txt"), buf);
+
+      const result = await adapter.diff(hugeRoot, "unstaged");
+      expect(result.truncated).toBe(true);
+      expect(result.sections[0]!.files_changed).toBe(1);
+      expect(Buffer.byteLength(result.sections[0]!.diff, "utf8")).toBeLessThanOrEqual(DEFAULT_LIMITS.maxDiffPayloadBytes);
     });
 
     it("reports an empty diff for a clean repository", async () => {
@@ -310,6 +343,23 @@ describe("GitAdapter", () => {
       expect(fs.existsSync(marker)).toBe(false);
       expect(result.sections[0]!.diff).not.toContain("FAKE DIFF");
       expect(result.sections[0]!.diff).toContain("src/app.ts");
+    });
+
+    it("prevents repository-local core.fsmonitor from executing external scripts", async () => {
+      const marker = path.join(scratch, "fsmonitor-marker.txt");
+      const script = path.join(scratch, "fsmonitor.sh");
+      fs.writeFileSync(
+        script,
+        `#!/bin/sh\ntouch "${marker}"\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      git(root, "config", "core.fsmonitor", script);
+
+      await adapter.status(root);
+      expect(fs.existsSync(marker)).toBe(false);
+
+      await adapter.diff(root, "unstaged");
+      expect(fs.existsSync(marker)).toBe(false);
     });
   });
 });
