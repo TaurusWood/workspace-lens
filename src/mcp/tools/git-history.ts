@@ -1,5 +1,4 @@
 import { successEnvelope } from "../../core/errors.js";
-import { DEFAULT_LIMITS } from "../../core/limits.js";
 import { GitAdapter, validateRevisionInput } from "../../adapters/git.js";
 import type { ToolDefinition } from "../tool-runner.js";
 import { gitHistorySchema } from "../schemas.js";
@@ -26,7 +25,7 @@ export const gitHistoryTool: ToolDefinition<typeof gitHistorySchema> = {
     const result = await adapter.history(
       workspace.root,
       start,
-      args.max_commits ?? DEFAULT_LIMITS.defaultGitHistoryCommits,
+      args.max_commits ?? context.limits.defaultGitHistoryCommits,
     );
 
     return successEnvelope({

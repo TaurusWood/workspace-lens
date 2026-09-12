@@ -165,6 +165,28 @@ describe("historical git tools over MCP", () => {
     expect(bounded.data.truncated).toBe(true);
   });
 
+  it("git_history uses the active server default when max_commits is omitted", async () => {
+    const customContext: ToolContext = {
+      ...context,
+      limits: { ...context.limits, defaultGitHistoryCommits: 1 },
+    };
+    const server = createWorkspaceLensServer(customContext);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const customClient = new Client({ name: "custom-default-client", version: "0.0.0" });
+    await Promise.all([server.connect(serverTransport), customClient.connect(clientTransport)]);
+    try {
+      const result = (await customClient.callTool({
+        name: "git_history",
+        arguments: { workspace_id: "diverged" },
+      })) as CallToolResult;
+      const data = envelope(result).data;
+      expect(data.commits).toHaveLength(1);
+      expect(data.truncated).toBe(true);
+    } finally {
+      await customClient.close();
+    }
+  });
+
   it("git_history rejects invalid revision grammar with INVALID_ARGUMENT before adapter use", async () => {
     const spy = vi.spyOn(GitAdapter.prototype, "history");
     try {
