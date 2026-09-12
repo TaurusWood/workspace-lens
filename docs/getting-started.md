@@ -1,6 +1,6 @@
 # WorkspaceLens Getting Started
 
-Status: Canonical setup guide for v0.2. It documents the real, verified path from a clean install to a working review conversation — including the current manual lifecycle steps. Lifecycle automation (daemon management, autostart, onboarding wizard) is deliberately deferred to v0.3; nothing here is aspirational.
+Status: Canonical setup guide for v0.2. It documents the repository-supported path from a clean install to a working review conversation, including the current manual lifecycle steps. The connection path and real `workspace_list` call were verified for v0.1; the full v0.2 local-commit plus working-tree ChatGPT acceptance run remains a release gate. Lifecycle automation (daemon management, autostart, onboarding wizard) is deliberately deferred to v0.3.
 
 Two usage paths are supported:
 
@@ -148,7 +148,7 @@ workspace_list → git_history → git_commit → git_compare(base, HEAD)
 - `git_status` / `git_diff` cover the uncommitted remainder.
 - Local-only commits work exactly like pushed ones — GitHub is never contacted.
 
-Sensitive paths (`.env`, keys, credentials) are redacted everywhere, including inside history.
+Sensitive path names and file/diff bodies (`.env`, keys, credentials) are redacted from historical comparisons as well as current workspace reads. Commit subjects and author names are bounded but not secret-scanned; they remain untrusted repository metadata.
 
 ## 10. Daily usage
 
@@ -169,11 +169,12 @@ After one-time setup there is no per-review initialization:
 | ChatGPT shows no tools or an empty result | The tunnel process is probably not running (restart step 6), the app's tunnel selection points at a different tunnel, or developer mode is off. With the tunnel stopped, ChatGPT may surface an empty tool result rather than an explicit error — check the daemon first. [ChatGPT + OpenAI Platform] |
 | Reviewer runs shell commands instead of using the tools | Models with a built-in bash tool sometimes default to it. Attach the WorkspaceLens app to the conversation or name the tools explicitly in the prompt (platform behavior, not a WorkspaceLens defect). |
 | `GIT_REVISION_NOT_FOUND` from history tools | The revision syntax is restricted commitish only (`HEAD`, branch, tag, SHA). Ancestry syntax like `HEAD~1` and ranges like `main..HEAD` are intentionally rejected; ask for the history first, then pick SHAs. |
-| A file is invisible to the reviewer | Default policy blocks `.env`, keys, credentials, and dependency/build trees everywhere — including inside Git history. This is intentional. |
+| A file is invisible to the reviewer | Default policy blocks `.env`, keys, credentials, and dependency/build trees from current reads and historical diff output. Commit subjects/authors are metadata and are not secret-scanned. |
 
 ## Where to read more
 
 - [Product Experience](product-experience.md) — what WorkspaceLens is and is not.
 - [Security Model](security-model.md) — the read-only boundary and its limits.
-- [MCP Tools Specification](mcp-tools-spec.md) — the complete tool contract.
+- [MCP Tools Specification](mcp-tools-spec.md) — the v0.1 base contract.
+- [v0.2 MCP Tools Contract](v0.2-mcp-tools-contract.md) — the authoritative `git_history`, `git_commit`, and `git_compare` delta.
 - [Architecture](architecture.md) — Core/adapter/MCP layering.

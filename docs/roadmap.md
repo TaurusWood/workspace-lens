@@ -50,6 +50,8 @@ Delivered:
 
 Status: implementation/current CLI product line.
 
+Status: implementation and automated gates complete; real ChatGPT acceptance pending.
+
 Goal:
 
 Complete the core read-only review context before adding a graphical local control plane.

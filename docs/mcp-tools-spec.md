@@ -871,6 +871,8 @@ Recommended MVP defaults:
 | `list_files` entries | 2,000 | Partial result with `truncated: true` |
 | Search results | 50 default / 100 caller max | `truncated: true` |
 | Diff payload | 256 KiB | Partial result with `truncated: true` |
+| Git history metadata fields | 4 KiB subject / 1 KiB author name | Field-level cut flagged as `metadata_truncated` |
+| Git history metadata payload | 128 KiB | Partial result with `truncated: true` |
 | `list_files.depth` | 5 max | `INVALID_ARGUMENT` above max |
 
 The implementation MAY make these values locally configurable, but tool callers MUST NOT be able to disable limits.

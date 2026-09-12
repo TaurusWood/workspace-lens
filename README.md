@@ -122,24 +122,24 @@ Blocked by default:
 - dependency directories such as `node_modules`
 - generated build artifacts
 
-Workspace access is limited to explicitly configured workspace roots. All paths are workspace-relative; canonical containment is verified with real-path resolution, so absolute paths, `..` traversal, and escaping symlinks are rejected. Blocked content cannot leak across `read_file`, `list_files`, `search_workspace`, `git_status`, `git_diff`, `git_history`, `git_commit`, or `git_compare` — they all share one AccessPolicy, and it applies to Git history too: a secret that only existed in an old commit cannot be read through `git_commit` or `git_compare`.
+Workspace access is limited to explicitly configured workspace roots. All paths are workspace-relative; canonical containment is verified with real-path resolution, so absolute paths, `..` traversal, and escaping symlinks are rejected. AccessPolicy blocks sensitive path names and file/diff bodies across current and historical content-bearing tools, including secrets that existed only in old commits. Commit metadata is different: `git_history` and `git_commit` intentionally return bounded author names and subjects, which are untrusted repository data and are not secret-scanned. Do not place credentials in commit messages.
 
 WorkspaceLens cannot modify files, execute commands, or run arbitrary Git/search arguments. Public revisions are restricted commitishes (branch, tag, SHA, `HEAD`) — no ranges, ancestry syntax, or option-like values — and every revision is resolved to a concrete commit SHA through fixed internal Git templates before use. Workspace content is returned as untrusted data.
 
 ## ChatGPT Connection
 
-ChatGPT cannot reach `localhost` directly. The supported path is the official OpenAI **Secure MCP Tunnel** with `tunnel-client`; it requires an OpenAI Platform tunnel, a runtime API key, and ChatGPT developer mode. The full verified walkthrough lives in [`docs/getting-started.md`](docs/getting-started.md) — do not duplicate it here.
+ChatGPT cannot reach `localhost` directly. The supported path is the official OpenAI **Secure MCP Tunnel** with `tunnel-client`; it requires an OpenAI Platform tunnel, a runtime API key, and ChatGPT developer mode. The canonical repository walkthrough lives in [`docs/getting-started.md`](docs/getting-started.md) — do not duplicate it here.
 
 ## Status
 
-`v0.2` adds local committed-state review (`git_history`, `git_commit`, `git_compare`) so a reviewer can inspect local-only unpushed commits and a trusted-base-to-head range without GitHub, plus a canonical setup guide. v0.1 phases 1–11 of `docs/implementation-plan.md` (through real end-to-end ChatGPT validation) and the v0.2 contracts are implemented and covered by automated suites:
+`v0.2` adds local committed-state review (`git_history`, `git_commit`, `git_compare`) so a reviewer can inspect local-only unpushed commits and a trusted-base-to-head range without GitHub, plus a canonical setup guide. The implementation and automated contracts are present, but the v0.2 real ChatGPT acceptance gate is still pending; do not report the release complete until the Phase 7 workflow in `docs/v0.2-implementation-plan.md` is recorded successfully.
 
 ```bash
 npm run typecheck
 npm test
 ```
 
-Validated on the development environment:
+Previously validated v0.1 integration baseline:
 
 - **Gate 0**: a real ChatGPT conversation reached the disposable connection-test server through the official tunnel path (discovery, repeated calls, restart recovery, honest stop-failure).
 - **Phase 11**: a real ChatGPT review conversation used the full product server through the same tunnel to inspect local uncommitted changes (`pocket-railway`, real repository, no GitHub push, no file upload, read-only).
@@ -154,7 +154,8 @@ See:
 - [Getting Started](docs/getting-started.md) — the canonical setup guide
 - [Product Experience](docs/product-experience.md)
 - [Security Model](docs/security-model.md)
-- [MCP Tools Specification](docs/mcp-tools-spec.md)
+- [MCP Tools Specification](docs/mcp-tools-spec.md) — v0.1 base contract
+- [v0.2 MCP Tools Contract](docs/v0.2-mcp-tools-contract.md) — authoritative three-tool delta
 - [Architecture](docs/architecture.md)
 - [Implementation Plan](docs/implementation-plan.md)
 - [Roadmap](docs/roadmap.md)
