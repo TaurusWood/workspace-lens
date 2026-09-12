@@ -4,10 +4,10 @@ import { importExpected } from "../helpers/expected-module.js";
 import {
   assertNoRealUserState,
   createIsolatedProductEnv,
-  isolatedProductOptions,
   type IsolatedProductEnv,
 } from "../helpers/isolated-env.js";
 import { cleanupWorkspace, makePlainWorkspace } from "../helpers/mcp.js";
+import { spawnProductChild, type ProductChild } from "../helpers/spawn-product-child.js";
 import { REPO_ROOT_V03 } from "../helpers/spawn-cli.js";
 
 /**
@@ -20,43 +20,51 @@ import { REPO_ROOT_V03 } from "../helpers/spawn-cli.js";
  * accepted here, so a broken Control API or WebUI path cannot hide behind a
  * green service layer.
  *
- * Every flow runs inside an isolated product environment (temporary HOME,
- * config, control state, runtime state, test adapters) per §14's
- * "clean temporary user/config state" requirement.
+ * Every flow runs in a DEDICATED child process inside an isolated product
+ * environment (HOME/XDG_* and WORKSPACE_LENS_CONFIG at a temp state root, adapter
+ * objects injected by the tests), and the runtime lifecycle is leak-proof:
+ * spawn → readiness → probes → stop → the runtime's port must drain before
+ * the temp state is removed.
  *
  * E2E-008 (real ChatGPT verification) is an intentionally manual release
  * gate documented in tests/v0.3/product/MANUAL-E2E-008-chatgpt.md — it is
  * never automated.
  */
 
-interface StartedRuntime {
+interface StartedProduct {
   url: string;
-  runtime: { baseUrl: string; mcpUrl?: string; pid?: number; stop(): Promise<void> };
-  configPath?: string;
-  reused?: boolean;
-  restarted?: boolean;
+  runtime: { baseUrl: string; pid: number; stop(): Promise<void> };
+  restarted: boolean;
+  child: ProductChild;
   capturedCliInvocations?: string[];
 }
 
-async function startProduct(tag: string, extra: Record<string, unknown> = {}): Promise<{ env: IsolatedProductEnv; started: StartedRuntime }> {
-  const { runStart } = await importExpected("startCommand");
+async function startProduct(tag: string, extra: Record<string, unknown> = {}): Promise<{ env: IsolatedProductEnv; started: StartedProduct }> {
+  // Progressive RED gate: the canonical start command does not exist yet.
+  await importExpected("startCommand");
   const env = createIsolatedProductEnv(tag);
   assertNoRealUserState(env);
-  const launched: string[] = [];
-  const started = (await runStart({
-    ...isolatedProductOptions(env),
-    browserLauncher: (url: string) => {
-      launched.push(url);
+  const child = await spawnProductChild(env, {
+    entry: "start",
+    tunnelState: (extra.tunnelAdapter as any)?.simulateState === "stopped" ? "stopped" : "healthy",
+    extraOptions: extra.extraOptions as Record<string, unknown> | undefined,
+  });
+  return {
+    env,
+    started: {
+      url: child.url,
+      runtime: { baseUrl: child.url, pid: child.pid, stop: () => child.stop() },
+      restarted: false,
+      child,
+      capturedCliInvocations: child.result.capturedCliInvocations,
     },
-    ...extra,
-  })) as StartedRuntime;
-  // The test never opens a real browser.
-  expect(launched.every((url) => url.startsWith("http://127.0.0.1"))).toBe(true);
-  return { env, started };
+  };
 }
 
-async function stopProduct(started: StartedRuntime, env: IsolatedProductEnv): Promise<void> {
-  await (started.runtime?.stop?.() ?? Promise.resolve());
+async function stopProduct(started: StartedProduct, env: IsolatedProductEnv): Promise<void> {
+  // Leak-proof: the stop protocol SIGTERMs the child, stops its runtime, and
+  // waits until the runtime's port drains before the temp state is removed.
+  await started.child.stop();
   env.cleanup();
 }
 
@@ -130,27 +138,79 @@ describe("E2E — product flow acceptance (package-shaped)", () => {
     await importExpected("startCommand");
     const { env, binPath } = await installPackageShape("e2e001");
     const { spawn } = await import("node:child_process");
+    const net = await import("node:net");
+    let child: any;
+    let baseUrl = "";
     try {
       assertNoRealUserState(env);
-      // Run the INSTALLED bin from a cwd unrelated to the repository.
-      const child = spawn(binPath, ["start"], {
+      // Run the INSTALLED bin from a cwd unrelated to the repository, as its
+      // own process group so the test can reliably stop the runtime.
+      child = spawn(binPath, ["start"], {
         cwd: "/tmp",
         env: { ...process.env, ...env.env },
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       });
       const stdout: string[] = [];
       child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk.toString()));
       const exitCode = await new Promise<number | null>((resolve, reject) => {
-        child.on("exit", (code) => resolve(code));
+        child.on("exit", (code: number | null) => resolve(code));
         child.on("error", reject);
       });
       // v0.3 requires the canonical start flow to succeed from the install.
       expect(exitCode).toBe(0);
       const output = stdout.join("");
       // The command must surface the local WebUI URL.
-      expect(output).toMatch(/http:\/\/127\.0\.0\.1:\d+/);
+      const urlMatch = output.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+      expect(urlMatch).not.toBeNull();
+      baseUrl = urlMatch![0];
+
+      // Startup success must be PROVEN, not printed: health, WebUI, /mcp.
+      const health = await fetch(`${baseUrl}/healthz`);
+      expect(health.status).toBe(200);
+      const webui = await fetch(`${baseUrl}/`);
+      expect(webui.status).toBe(200);
+      expect(webui.headers.get("content-type")).toContain("text/html");
+      const mcp = await fetch(`${baseUrl}/mcp`, { method: "GET" });
+      // The MCP endpoint must exist (405/400/SSE-upgrade are fine; 404 is not).
+      expect(mcp.status).not.toBe(404);
     } finally {
-      env.cleanup();
+      // Leak-proof cleanup: stop the whole process group, then require the
+      // runtime's port to drain before the temp state is removed.
+      try {
+        if (child?.pid) {
+          try {
+            process.kill(-child.pid, "SIGTERM");
+          } catch {
+            child.kill("SIGTERM");
+          }
+        }
+        const port = Number.parseInt(new URL(baseUrl).port ?? "0", 10);
+        if (port > 0) {
+          const deadline = Date.now() + 10000;
+          for (;;) {
+            const open = await new Promise<boolean>((resolve) => {
+              const socket = net.connect({ port, host: "127.0.0.1" });
+              socket.once("connect", () => {
+                socket.destroy();
+                resolve(true);
+              });
+              socket.once("error", () => resolve(false));
+              socket.setTimeout(1000, () => {
+                socket.destroy();
+                resolve(false);
+              });
+            });
+            if (!open || Date.now() > deadline) {
+              expect(open).toBe(false);
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        }
+      } finally {
+        env.cleanup();
+      }
     }
   });
 
@@ -196,7 +256,9 @@ describe("E2E — product flow acceptance (package-shaped)", () => {
 
       // Add B through the Control API product path; do NOT restart the
       // Control Runtime and do NOT restart any tunnel adapter/runtime.
+      // The runtime identity must be a real, non-empty test observable.
       const pidBefore = started.runtime.pid;
+      expect(typeof pidBefore).toBe("number");
       expect((await apiAddWorkspace(session, workspaceB.root, "e2e003-b")).status).toBeLessThan(300);
 
       // The very next MCP request over the SAME client connection must see
@@ -206,7 +268,7 @@ describe("E2E — product flow acceptance (package-shaped)", () => {
       expect(JSON.stringify(after)).toContain("e2e003-b");
       // Same runtime process, same client connection.
       expect(started.runtime.pid).toBe(pidBefore);
-      expect(started.restarted ?? false).toBe(false);
+      expect(started.restarted).toBe(false);
     } finally {
       await client?.close().catch(() => {});
       cleanupWorkspace(workspaceA);

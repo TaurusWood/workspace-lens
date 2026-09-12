@@ -59,13 +59,20 @@ describe("GATE-C SecretStore feasibility on Node 24", () => {
     ) as {
       dependencies?: Record<string, string>;
     };
+    // An OS-backed store implementation must be concretely declared: a bare
+    // in-memory Map SecretStore with no OS credential dependency cannot pass
+    // this gate. The allowlist holds the candidates named by the
+    // implementation plan's Gate C; a different OS-backed selection requires
+    // an owner decision and updating this allowlist.
     const dependencyNames = Object.keys(pkg.dependencies ?? {});
-    // An OS-backed store implementation must actually be declared as a
-    // production dependency (install/build on Node 24 is part of the gate).
-    expect(dependencyNames.length).toBeGreaterThan(1);
+    const osStoreDependencies = dependencyNames.filter((name) =>
+      /^(keytar|@github\/keytar)$/.test(name),
+    );
+    expect(osStoreDependencies).toEqual([expect.any(String)]);
     const mod = await importExpected("secretStore");
     const store = new mod.SecretStore({ namespace: "workspace-lens-v0.3-gate-c-feasibility" });
-    // Instantiation and availability probing must not throw on Node 24.
+    // Instantiation and availability probing must not throw on Node 24; the
+    // REAL set/get/delete feasibility round trip is GATE-C-2.
     await expect(store.available()).resolves.toEqual(expect.any(Boolean));
   });
 

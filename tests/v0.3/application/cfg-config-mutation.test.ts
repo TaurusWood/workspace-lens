@@ -153,7 +153,7 @@ fs.writeFileSync(outFile, JSON.stringify({ reads, parseFailures }));
     }
   });
 
-  it("CFG-004 applies mutations to the latest config; a newer change is preserved", async () => {
+  it("CFG-004 deterministically proves the mutation reads the latest config after lock acquisition", async () => {
     // RED gate first: the locked application mutation layer does not exist yet.
     await importExpected("workspaceAdminService");
     const configPath = newConfigFile();
@@ -162,21 +162,34 @@ fs.writeFileSync(outFile, JSON.stringify({ reads, parseFailures }));
     const workspaceB = makePlainWorkspace("cfg004b");
     try {
       // Actor A (child process) reads the config into a stale in-memory view
-      // and signals readiness (read completes BEFORE the gate, see
-      // spawn-mutation.ts)...
-      const childA = spawnMutationChild(configPath, { tag: "stale-a", root: workspaceA.root, id: "cfg004-a" }, gateDir);
+      // and signals readiness (read completes BEFORE the gate), and its
+      // mutation carries the deterministic afterLoad seam: once A's in-lock
+      // load completes, the hook asserts the base state already contains B.
+      const childA = spawnMutationChild(
+        configPath,
+        {
+          tag: "stale-a",
+          root: workspaceA.root,
+          id: "cfg004-a",
+          afterLoadCheck: { expectsWorkspaceId: "cfg004-b" },
+        },
+        gateDir,
+      );
       await childA.ready;
-      // ...while actor B (this process) completes a newer accepted change.
+      // Actor B (this process) completes a newer accepted change while A is
+      // parked at the gate.
       const store = new ConfigStore(configPath);
       store.add(workspaceB.root, { id: "cfg004-b" });
-      // ...then actor A proceeds. Its mutation must operate on the latest
-      // config after lock acquisition, preserving B's change.
+      // Release A. The afterLoad hook proves WITHOUT relying on the scheduler
+      // that A's mutation base state is the post-B config; a stale snapshot
+      // (cached at construction or from the earlier read) fails the child.
       fs.writeFileSync(childA.goFile, "go");
       const exitA = await childA.exitCode;
       if (exitA === CHILD_EXIT_MODULE_MISSING) {
         await importExpected("workspaceAdminService");
         throw new Error("Child reported missing module but importExpected passed");
       }
+      expect(exitA).not.toBe(5); // AFTER_LOAD_ASSERTION_FAILED would mean a stale base state
       expect(exitA).toBe(0);
       const config = store.load();
       const ids = config.workspaces.map((ws) => ws.workspace_id);

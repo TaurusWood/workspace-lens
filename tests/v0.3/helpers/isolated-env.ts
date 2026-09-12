@@ -5,14 +5,27 @@
  * developer's real user state (`~/.config/workspace-lens`, the real runtime
  * lock, real tunnel aliases, the OS keychain, or real login-startup entries)
  * — `docs/v0.3-test-contract.md` §14 requires a clean temporary user/config
- * state. Every product-facing test receives its environment from this helper
- * and passes the returned options into the runtime/start command, which must
- * honor them instead of process-global defaults.
+ * state. Two complementary layers enforce this:
+ *
+ * 1. Isolated FILES: every artifact (config, control state, runtime state)
+ *    lives inside a temporary state root, and `assertNoRealUserState` guards
+ *    against accidental aliasing of the real home.
+ * 2. Isolated PROCESS + ADAPTERS: product-level flows run in a dedicated
+ *    child process (see `spawn-product-child.ts`) with HOME,
+ *    XDG_CONFIG_HOME, XDG_STATE_HOME and WORKSPACE_LENS_CONFIG pointed at
+ *    the temp state root, and with Secret/Startup/Tunnel adapter OBJECTS
+ *    injected from the tests (`test-adapters.ts`) — never production
+ *    "test-mode" strings and never the real OS integrations.
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { makeTempRoot } from "../../helpers/fixtures.js";
+import {
+  inMemorySecretAdapter,
+  inMemoryStartupAdapter,
+  stubTunnelAdapter,
+} from "./test-adapters.js";
 
 export interface IsolatedProductEnv {
   /** Temporary HOME/state root; every product artifact must live inside. */
@@ -25,7 +38,7 @@ export interface IsolatedProductEnv {
   runtimeStatePath: string;
   /** Test-only secret namespace; never the user's real OS keychain entries. */
   secretNamespace: string;
-  /** Environment patch (HOME/WORKSPACE_LENS_CONFIG/...) for child processes. */
+  /** Environment patch (HOME, XDG_* vars, WORKSPACE_LENS_CONFIG) for children. */
   env: Record<string, string>;
   /** Recursively lists every artifact the product created in the state root. */
   listStateRootFiles(): string[];
@@ -50,9 +63,12 @@ export function createIsolatedProductEnv(tag: string): IsolatedProductEnv {
     secretNamespace: `workspace-lens-v0.3-test-${tag}`,
     env: {
       HOME: stateRoot,
+      XDG_CONFIG_HOME: path.join(stateRoot, ".config"),
+      XDG_DATA_HOME: path.join(stateRoot, ".local", "share"),
+      XDG_STATE_HOME: path.join(stateRoot, ".local", "state"),
       WORKSPACE_LENS_CONFIG: configPath,
-      WL_V03_CONTROL_STATE_PATH: controlStatePath,
-      WL_V03_RUNTIME_STATE_PATH: runtimeStatePath,
+      // Secret stores keyed to the test namespace only.
+      WORKSPACE_LENS_SECRET_NAMESPACE: `workspace-lens-v0.3-test-${tag}`,
     },
     listStateRootFiles(): string[] {
       const files: string[] = [];
@@ -81,9 +97,9 @@ export function createIsolatedProductEnv(tag: string): IsolatedProductEnv {
 
 /**
  * Canonical product-facing options every Control Runtime / `start` invocation
- * in the v0.3 contract suite must receive: isolated state, test adapters, and
- * a no-op browser launcher. Adapters are named by the implementation plan
- * (injectable browser-launch adapter, tunnel stub, startup test adapter).
+ * in the v0.3 contract suite must receive: isolated state paths, injected
+ * adapter OBJECTS from the tests (never production "test-mode" strings), and
+ * a no-op browser launcher.
  */
 export function isolatedProductOptions(env: IsolatedProductEnv): Record<string, unknown> {
   return {
@@ -91,9 +107,9 @@ export function isolatedProductOptions(env: IsolatedProductEnv): Record<string, 
     controlStatePath: env.controlStatePath,
     runtimeStatePath: env.runtimeStatePath,
     secretNamespace: env.secretNamespace,
-    secretAdapter: "test",
-    startupAdapter: "test",
-    tunnelAdapter: "stub",
+    secretAdapter: inMemorySecretAdapter(),
+    startupAdapter: inMemoryStartupAdapter(),
+    tunnelAdapter: stubTunnelAdapter("stopped"),
     browserLauncher: () => {},
     env: env.env,
   };
@@ -102,7 +118,7 @@ export function isolatedProductOptions(env: IsolatedProductEnv): Record<string, 
 /** Guard: the real user config must never exist inside a test state root. */
 export function assertNoRealUserState(env: IsolatedProductEnv): void {
   const realDefault = path.join(os.homedir(), ".config", "workspace-lens");
-  if (realDefault.startsWith(env.stateRoot)) {
-    throw new Error("Isolated env resolved into the real user home; refusing to continue");
+  if (realDefault.startsWith(env.stateRoot) || env.stateRoot.startsWith(realDefault)) {
+    throw new Error("Isolated env overlaps the real user home; refusing to continue");
   }
 }

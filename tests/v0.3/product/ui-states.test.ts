@@ -1,50 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { importExpectedPath } from "../helpers/expected-module.js";
+import { mountRealUi, type RenderedUi } from "../helpers/render-ui.js";
 
 /**
  * WebUI Test Boundary contracts (`docs/v0.3-test-contract.md` §13):
  * UI-001..005.
  *
- * These contracts mount the REAL WebUI application through its component
- * test harness (`ui/test-support/index.ts`, provided by Slice 13–15) and
- * assert user-observable behavior — never CSS classes, DOM nesting, or
- * pixel values. There is deliberately no capability-only shortcut: until the
- * test harness module exists every test is RED, and once it exists the
- * assertions below run against the rendered application, so creating an
- * empty `ui/` skeleton cannot turn them green.
+ * These contracts mount the REAL WebUI root component (`ui/src/App`) from the
+ * TEST side (`helpers/render-ui.ts`): Testing Library render + a fake Control
+ * API served through the fetch layer. Production code cannot define how it is
+ * tested — there is no production-owned test-support adapter, and a fake
+ * `renderApp()` cannot satisfy these tests because the component under test
+ * is the same module the product entry point renders.
  *
- * The test-support contract the UI must provide (Slice 13):
- * - `renderApp(initialState)` mounts the real root component into a test
- *   renderer and returns testing-library style queries
- *   (`getByText`, `queryByRole`, `getByRole`, `click`);
- * - `seedApiState(state)` pins what `GET /api/v1/*` returns so rendering is
- *   deterministic without a live runtime.
+ * Assertions are behavior-level (§13): visible text, roles, and accessibility
+ * semantics — never CSS classes, DOM nesting, or pixel values.
  */
-
-const UI_SLICE = "Slices 13–15 — React/Vite WebUI";
-
-interface UiScreen {
-  getByText(text: string | RegExp): unknown;
-  queryByText(text: string | RegExp): unknown;
-  getByRole(role: string, options?: { name?: string | RegExp }): unknown;
-  queryByRole(role: string, options?: { name?: string | RegExp }): unknown;
-  click(target: unknown): void;
-}
-
-interface UiTestSupport {
-  renderApp(initialState: Record<string, unknown>): UiScreen;
-  seedApiState(state: Record<string, unknown>): void;
-}
-
-async function mountUi(initialState: Record<string, unknown>): Promise<UiScreen> {
-  const support = (await importExpectedPath(
-    "ui/test-support/index.ts",
-    "WebUI application + component test harness",
-    UI_SLICE,
-  )) as UiTestSupport;
-  support.seedApiState(initialState);
-  return support.renderApp(initialState);
-}
 
 const WORKSPACE_A = {
   workspace_id: "ws-alpha",
@@ -56,26 +26,42 @@ const WORKSPACE_A = {
 
 describe("UI — WebUI behavior contracts", () => {
   it("UI-001 renders Workspaces empty/populated states with identity, state, and navigation", async () => {
-    // Empty state: the primary add action is reachable.
-    const empty = await mountUi({ workspaces: [] });
-    expect(empty.queryByRole("button", { name: /add workspace/i })).toBeTruthy();
+    const empty = await mountRealUi({ workspaces: [] });
+    try {
+      // Empty state: the primary add action is reachable.
+      expect(empty.screen.queryByRole("button", { name: /add workspace/i })).toBeTruthy();
+    } finally {
+      empty.unmount();
+    }
 
-    // Populated state: workspace identity, enabled/disabled/error state, and
-    // a path to the detail view.
-    const populated = await mountUi({
-      workspaces: [WORKSPACE_A, { ...WORKSPACE_A, workspace_id: "ws-beta", name: "Beta", enabled: false, state: "disabled" }],
+    const populated = await mountRealUi({
+      workspaces: [
+        WORKSPACE_A,
+        { ...WORKSPACE_A, workspace_id: "ws-beta", name: "Beta", enabled: false, state: "disabled" },
+      ],
     });
-    expect(populated.getByText("Alpha")).toBeTruthy();
-    expect(populated.getByText("Beta")).toBeTruthy();
-    expect(populated.getByText(/disabled/i)).toBeTruthy();
+    try {
+      expect(populated.screen.getByText("Alpha")).toBeTruthy();
+      expect(populated.screen.getByText("Beta")).toBeTruthy();
+      // Enabled/disabled state must be visible as text, not color alone.
+      expect(populated.screen.getByText(/disabled/i)).toBeTruthy();
 
-    populated.click(populated.getByText("Alpha"));
-    expect(populated.queryByText(/alpha/i)).toBeTruthy();
+      // Navigation to the detail view: after clicking the workspace, detail
+      // management actions (rename/disable/remove) become reachable.
+      populated.fireEvent.click(populated.screen.getByText("Alpha"));
+      await populated.waitFor(() => {
+        expect(
+          populated.screen.queryByRole("button", { name: /rename|disable|remove/i }) ??
+            populated.screen.queryByRole("link", { name: /rename|disable|remove/i }),
+        ).toBeTruthy();
+      });
+    } finally {
+      populated.unmount();
+    }
   });
 
   it("UI-002 never overclaims provider state beyond locally observable truth", async () => {
-    // Locally healthy tunnel runtime, provider-side state NOT verified.
-    const screen = await mountUi({
+    const ui = await mountRealUi({
       workspaces: [WORKSPACE_A],
       connection: {
         localRuntime: "healthy",
@@ -84,45 +70,71 @@ describe("UI — WebUI behavior contracts", () => {
         verification: "none",
       },
     });
-    const text = String(screen.queryByText(/chatgpt|connected/i) ?? "");
-    // No unsupported `ChatGPT connected` claim when provider state is
-    // unverified.
-    expect(/chatgpt\s+connected/i.test(text)).toBe(false);
-    expect(screen.getByText(/unverified|not verified|pending/i)).toBeTruthy();
+    try {
+      // No "ChatGPT connected" (or equivalent) claim anywhere on the screen:
+      // asserted directly against matching text nodes.
+      expect(ui.screen.queryByText(/chatgpt\s+connected/i)).toBeNull();
+      // The unverified provider state must be visibly distinguished.
+      expect(ui.screen.getByText(/unverified|not verified|pending/i)).toBeTruthy();
+    } finally {
+      ui.unmount();
+    }
   });
 
   it("UI-003 distinguishes Verified from User confirmed beyond color alone", async () => {
-    const screen = await mountUi({
+    const ui = await mountRealUi({
       workspaces: [
         { ...WORKSPACE_A, workspace_id: "ws-verified", name: "Verified One", verification: "machine-verified" },
         { ...WORKSPACE_A, workspace_id: "ws-confirmed", name: "Confirmed One", verification: "user-confirmed" },
       ],
     });
-    expect(screen.getByText(/verified/i)).toBeTruthy();
-    expect(screen.getByText(/user confirmed/i)).toBeTruthy();
-    // The two treatments must differ in text/semantics, not only color.
-    expect(String(screen.getByText(/verified/i))).not.toBe(String(screen.getByText(/user confirmed/i)));
+    try {
+      // Both treatments must exist as distinct text/semantics.
+      expect(ui.screen.getByText(/machine-verified|^verified$/i)).toBeTruthy();
+      expect(ui.screen.getByText(/user confirmed|user-confirmed/i)).toBeTruthy();
+    } finally {
+      ui.unmount();
+    }
   });
 
   it("UI-004 words destructive removal precisely: authorization only, local files untouched", async () => {
-    const screen = await mountUi({
-      workspaces: [WORKSPACE_A],
-      removeConfirmation: { workspaceId: "ws-alpha" },
-    });
-    screen.click(screen.getByRole("button", { name: /remove/i }));
-    // The confirmation must state BOTH halves of the contract.
-    expect(screen.getByText(/authorization/i)).toBeTruthy();
-    expect(screen.getByText(/local files|files.*untouched|untouched/i)).toBeTruthy();
+    const ui = await mountRealUi({ workspaces: [WORKSPACE_A] });
+    try {
+      ui.fireEvent.click(ui.screen.getByRole("button", { name: /remove/i }));
+      await ui.waitFor(() => {
+        // The confirmation must state BOTH halves of the contract.
+        expect(ui.screen.getByText(/authorization/i)).toBeTruthy();
+        expect(ui.screen.getByText(/local files|untouched/i)).toBeTruthy();
+      });
+    } finally {
+      ui.unmount();
+    }
   });
 
   it("UI-005 reconstructs setup progress from current state, not a stored page index", async () => {
-    // Server says: system done, first workspace done, tunnel NOT done.
-    const screen = await mountUi({
-      setup: { system: "done", firstWorkspace: "done", tunnel: "pending", chatgpt: "pending", verify: "pending" },
+    // Server state: system + first workspace done, tunnel pending. A stale
+    // stored wizard index pointing at a later stage must be ignored.
+    const ui = await mountRealUi({
+      setup: {
+        system: "done",
+        firstWorkspace: "done",
+        tunnel: "pending",
+        chatgpt: "pending",
+        verify: "pending",
+      },
     });
-    // The setup flow resumes at the first pending stage even if a stale
-    // stored index would have pointed elsewhere.
-    expect(screen.getByText(/tunnel/i)).toBeTruthy();
-    expect(screen.queryByText(/chatgpt/i) ?? null).toBeTruthy();
+    try {
+      // The CURRENT active stage must semantically be Tunnel — asserted via
+      // the accessibility marker (aria-current="step"), not styling.
+      await ui.waitFor(() => {
+        const currentStage = (globalThis as any).document.querySelector('[aria-current="step"]');
+        expect(currentStage?.textContent ?? "").toMatch(/tunnel/i);
+      });
+      // No later stage is marked active (guards against a stale index).
+      const allCurrent = Array.from((globalThis as any).document.querySelectorAll('[aria-current="step"]'));
+      expect(allCurrent).toHaveLength(1);
+    } finally {
+      ui.unmount();
+    }
   });
 });

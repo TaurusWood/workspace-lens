@@ -3,9 +3,9 @@ import { importExpected } from "../helpers/expected-module.js";
 import {
   assertNoRealUserState,
   createIsolatedProductEnv,
-  isolatedProductOptions,
   type IsolatedProductEnv,
 } from "../helpers/isolated-env.js";
+import { spawnProductChild, type ProductChild } from "../helpers/spawn-product-child.js";
 
 /**
  * L2 — Control Runtime and HTTP Integration Contracts: HTTP-001..004
@@ -17,100 +17,91 @@ import {
  * turn them green: health/readiness, single runtime ownership, cwd-independent
  * WebUI assets, and MCP/API surface separation.
  *
- * Every runtime runs inside an isolated product environment (temporary HOME,
- * config, control state, runtime state, test adapters) so no contract test
- * can ever touch the developer's real user state.
+ * Every runtime runs in a DEDICATED child process inside an isolated product
+ * environment (HOME/XDG_* and WORKSPACE_LENS_CONFIG pointed at a temp state root,
+ * adapter objects injected by the tests). The lifecycle protocol is
+ * leak-proof: spawn → readiness signal → HTTP probes → stop → port must
+ * drain, or the contract fails.
  */
 
-interface RuntimeUnderTest {
-  baseUrl: string;
-  stop(): Promise<void>;
-  __env: IsolatedProductEnv;
-}
-
-async function startRuntime(options: Record<string, unknown> = {}): Promise<RuntimeUnderTest> {
-  const mod = await importExpected("controlRuntime");
-  const env = createIsolatedProductEnv("http");
-  const runtime = await mod.startControlRuntime({
-    ...isolatedProductOptions(env),
-    ...options,
-    configPath: env.configPath,
-    controlStatePath: env.controlStatePath,
-    runtimeStatePath: env.runtimeStatePath,
-  });
-  runtime.__env = env;
-  return runtime;
-}
-
-async function withRuntime(
-  options: Record<string, unknown>,
-  run: (runtime: RuntimeUnderTest) => Promise<void>,
+async function withProductChild(
+  tag: string,
+  options: Parameters<typeof spawnProductChild>[1],
+  run: (child: ProductChild, env: IsolatedProductEnv) => Promise<void>,
 ): Promise<void> {
-  const runtime = await startRuntime(options);
+  const env = createIsolatedProductEnv(tag);
+  let child: ProductChild | undefined;
   try {
-    assertNoRealUserState(runtime.__env);
-    await run(runtime);
+    assertNoRealUserState(env);
+    child = await spawnProductChild(env, options);
+    await run(child, env);
   } finally {
-    await runtime.stop().catch(() => {});
-    runtime.__env.cleanup();
+    // Stop protocol: SIGTERM → child stops its runtime → port must drain.
+    await child?.stop();
+    env.cleanup();
   }
 }
 
 describe("HTTP — Control Runtime and HTTP integration", () => {
   it("HTTP-001 starts on a test port, reports health locally, and shuts down cleanly", async () => {
-    await withRuntime({ port: 0 }, async (runtime) => {
-      expect(runtime.baseUrl).toMatch(/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+$/);
-      const health = await fetch(`${runtime.baseUrl}/healthz`);
+    await importExpected("controlRuntime");
+    await withProductChild("http001", { entry: "control" }, async (child) => {
+      expect(child.url).toMatch(/^http:\/\/(127\.0\.0\.1|\[::1\]):\d+$/);
+      const health = await fetch(`${child.url}/healthz`);
       expect(health.status).toBe(200);
-      const ready = await fetch(`${runtime.baseUrl}/readyz`);
+      const ready = await fetch(`${child.url}/readyz`);
       expect(ready.status).toBe(200);
-      await runtime.stop();
-      // After shutdown the runtime no longer serves.
-      await expect(fetch(`${runtime.baseUrl}/healthz`)).rejects.toThrow();
+      await child.stop();
+      // After shutdown the runtime no longer serves (stop() already waited
+      // for the port to drain; this probe must fail).
+      await expect(fetch(`${child.url}/healthz`)).rejects.toThrow();
     });
   });
 
-  it("HTTP-002 rejects duplicate ownership or reuses the healthy runtime; never two managers", async () => {
-    await withRuntime({ port: 0 }, async (first) => {
-      // A second normal start for the SAME state root must reuse or be
-      // rejected — never coexist as an independent manager.
-      const mod = await importExpected("controlRuntime");
-      const env = first.__env;
-      const second = await mod.startControlRuntime({
-        ...isolatedProductOptions(env),
-        configPath: env.configPath,
-        controlStatePath: env.controlStatePath,
-        runtimeStatePath: env.runtimeStatePath,
-      });
-      if (second !== first && second.reusedExisting !== true) {
-        throw new Error("Second Control Runtime started independently: ownership violated");
+  it("HTTP-002 accepts reuse or explicit rejection; never two independent managers", async () => {
+    await importExpected("controlRuntime");
+    await withProductChild("http002", { entry: "control" }, async (first, env) => {
+      const healthBefore = await fetch(`${first.url}/healthz`);
+      expect(healthBefore.status).toBe(200);
+
+      // A second normal start for the SAME state root must either REUSE the
+      // healthy runtime or be REJECTED explicitly — both are contract-legal;
+      // silently coexisting as an independent manager is not.
+      let outcome: "reused" | "rejected";
+      try {
+        const second = await spawnProductChild(env, { entry: "control" });
+        outcome = second.result.reused === true ? "reused" : "rejected";
+        await second.stop({ expectDrain: false });
+      } catch {
+        // An explicit rejection (throw on duplicate ownership) is legal.
+        outcome = "rejected";
       }
-      if (second !== first) {
-        await second.stop?.();
-      }
-      // The first runtime is still healthy afterwards.
-      const health = await fetch(`${first.baseUrl}/healthz`);
-      expect(health.status).toBe(200);
+      expect(["reused", "rejected"]).toContain(outcome);
+
+      // Exactly one healthy manager remains: the first runtime still serves.
+      const healthAfter = await fetch(`${first.url}/healthz`);
+      expect(healthAfter.status).toBe(200);
     });
   });
 
   it("HTTP-003 serves WebUI assets from the installed location, not process.cwd()", async () => {
-    await withRuntime({ port: 0, workingDirectory: "/tmp" }, async (runtime) => {
-      const response = await fetch(`${runtime.baseUrl}/`);
+    await importExpected("controlRuntime");
+    await withProductChild("http003", { entry: "control" }, async (child) => {
+      // The child's cwd is its own temp dir, unrelated to the repository.
+      const response = await fetch(`${child.url}/`);
       expect(response.status).toBe(200);
-      // The UI shell resolves from the module/package location; the contract
-      // is that it does not depend on the repository checkout as cwd.
       expect(response.headers.get("content-type")).toContain("text/html");
     });
   });
 
   it("HTTP-004 keeps /mcp and /api/v1/* capabilities separated", async () => {
-    await withRuntime({ port: 0 }, async (runtime) => {
+    await importExpected("controlRuntime");
+    await withProductChild("http004", { entry: "control" }, async (child) => {
       // The MCP surface must not expose workspace administration, settings,
       // secret, startup, or tunnel lifecycle operations. Attempting an
       // admin-shaped tool call through the MCP endpoint must fail as an
       // unknown tool, and no admin passthrough route exists.
-      const response = await fetch(`${runtime.baseUrl}/mcp`, {
+      const response = await fetch(`${child.url}/mcp`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -130,58 +121,57 @@ describe("HTTP — Control Runtime and HTTP integration", () => {
 
 describe("START — canonical bootstrap (workspace-lens start)", () => {
   it("START-001 reuses a healthy runtime, starts when absent, and surfaces the local URL", async () => {
-    const { runStart } = await importExpected("startCommand");
-    const env = createIsolatedProductEnv("start");
+    await importExpected("startCommand");
+    const env = createIsolatedProductEnv("start001");
+    let first: ProductChild | undefined;
+    let second: ProductChild | undefined;
     try {
       assertNoRealUserState(env);
-      // The start command takes an injectable browser-launch adapter so tests
-      // never open a real browser, and runs against the isolated user state.
-      const launched: string[] = [];
-      const first = await runStart({
-        ...isolatedProductOptions(env),
-        browserLauncher: (url: string) => {
-          launched.push(url);
-        },
-      });
+      first = await spawnProductChild(env, { entry: "start" });
       expect(first.url).toMatch(/^http:\/\/127\.0\.0\.1/);
-      // A second start against the healthy runtime reuses it rather than
-      // duplicating ownership.
-      const second = await runStart({
-        ...isolatedProductOptions(env),
-        browserLauncher: (url: string) => {
-          launched.push(url);
-        },
-      });
-      expect(second.reused ?? second.runtime === first.runtime).toBe(true);
+      expect(first.result.reused).toBe(false);
+
+      // A second start against the healthy runtime must REUSE it (the
+      // canonical bootstrap never duplicates ownership)…
+      second = await spawnProductChild(env, { entry: "start" });
+      expect(second.result.reused).toBe(true);
+      // …and the runtime must be the same live instance, not a second one.
+      expect(second.result.runtimeBaseUrl ?? second.url).toBe(first.result.runtimeBaseUrl ?? first.url);
+
+      // Both start invocations surfaced the local WebUI URL.
+      const health = await fetch(`${first.url}/healthz`);
+      expect(health.status).toBe(200);
     } finally {
+      // Leak-proof cleanup: stop the runtime through either owner; the stop
+      // protocol waits until the port drains before the temp state is removed.
+      await second?.stop({ expectDrain: false });
+      await first?.stop();
       env.cleanup();
     }
   });
 
   it("START-001 (failure path) returns an actionable error when the local runtime cannot start", async () => {
-    const { runStart } = await importExpected("startCommand");
-    const env = createIsolatedProductEnv("start-fail");
+    await importExpected("startCommand");
+    const env = createIsolatedProductEnv("start001-fail");
     try {
+      assertNoRealUserState(env);
+      // Port 1 is a privileged port: binding must fail and surface an
+      // actionable error instead of starting a broken runtime.
       await expect(
-        runStart({ ...isolatedProductOptions(env), port: 1 }),
-      ).rejects.toThrow(/start|runtime|port|error/i);
+        spawnProductChild(env, { entry: "start", extraOptions: { port: 1 } }),
+      ).rejects.toThrow(/start|runtime|port|error|failed/i);
     } finally {
       env.cleanup();
     }
   });
 
   it("START-002 keeps the runtime healthy when the browser client terminates", async () => {
-    const { runStart } = await importExpected("startCommand");
-    const env = createIsolatedProductEnv("start-browser");
-    try {
-      const result = await runStart({ ...isolatedProductOptions(env) });
-      // The browser (test client) goes away; the Control Runtime stays
-      // healthy and the MCP endpoint remains available.
-      const health = await fetch(`${result.runtime.baseUrl}/healthz`);
+    await importExpected("startCommand");
+    await withProductChild("start002", { entry: "start" }, async (child) => {
+      // The browser (test client) never opens and "goes away"; the Control
+      // Runtime stays healthy and the MCP endpoint remains available.
+      const health = await fetch(`${child.url}/healthz`);
       expect(health.status).toBe(200);
-      await (result.runtime?.stop?.() ?? Promise.resolve());
-    } finally {
-      env.cleanup();
-    }
+    });
   });
 });

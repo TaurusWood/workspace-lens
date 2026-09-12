@@ -40,7 +40,20 @@ export interface MutationChildSpec {
   /** Workspace root the child adds through the application service. */
   root: string;
   id: string;
+  /**
+   * Deterministic mutation-phase seam (test contract for Slice 1): the
+   * WorkspaceAdminService/ConfigStore mutation must accept an optional
+   * `syncPoints.afterLoad(config)` callback, invoked SYNCHRONOUSLY after the
+   * in-lock load and before the mutation is applied. When set, the child
+   * asserts the loaded base state already contains the given workspace id —
+   * proving "the mutation operates on the latest config after lock
+   * acquisition" without relying on the scheduler. A stale base state fails
+   * the child with AFTER_LOAD_ASSERTION_FAILED.
+   */
+  afterLoadCheck?: { expectsWorkspaceId: string };
 }
+
+export const CHILD_EXIT_AFTER_LOAD_FAILED = 5;
 
 export interface MutationChildHandle {
   tag: string;
@@ -72,7 +85,18 @@ try {
     console.error("CHILD_MODULE_MISSING: application/workspace-admin-service.js not built");
     process.exit(${CHILD_EXIT_MODULE_MISSING});
   }
-  const service = new WorkspaceAdminService({ configStore: new ConfigStore(${JSON.stringify(configPath)}) });
+  const service = new WorkspaceAdminService({ configStore: new ConfigStore(${JSON.stringify(configPath)})${spec.afterLoadCheck ? `,
+    // Test-only deterministic seam: runs in-lock, after load, before apply.
+    syncPoints: {
+      afterLoad: (config) => {
+        const expected = ${JSON.stringify(spec.afterLoadCheck.expectsWorkspaceId)};
+        const ids = (config && Array.isArray(config.workspaces) ? config.workspaces : []).map((w) => w.workspace_id);
+        if (!ids.includes(expected)) {
+          console.error("AFTER_LOAD_ASSERTION_FAILED: mutation base state is missing " + expected + "; the in-lock load is not the latest config. ids=" + JSON.stringify(ids));
+          process.exit(5);
+        }
+      },
+    },` : ""} });
   // Read phase BEFORE signaling readiness: each child holds a stale in-memory
   // view of the config at gate time. This forces the mutation windows of all
   // children to overlap deterministically (CFG-001) and gives CFG-004 a real
