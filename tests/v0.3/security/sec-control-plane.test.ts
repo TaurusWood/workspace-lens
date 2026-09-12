@@ -1,7 +1,8 @@
 import fs from "node:fs";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { establishSession, apiRequest as mutatingRequest } from "../helpers/control-api.js";
 import { importExpected } from "../helpers/expected-module.js";
+import { assertNoRealUserState, createIsolatedProductEnv, isolatedProductOptions } from "../helpers/isolated-env.js";
 import { callTool, cleanupWorkspace, connectClient, makeConfig, makePlainWorkspace } from "../helpers/mcp.js";
 
 /**
@@ -25,12 +26,14 @@ const SENTINEL_SECRET = "SEC011_SENTINEL_SECRET_kq83mz";
 
 async function createRuntime(): Promise<any> {
   const mod = await importExpected("controlServer");
-  const dir = fs.mkdtempSync(path.join(import.meta.dirname, ".sec-runtime-"));
+  const env = createIsolatedProductEnv("sec");
   const runtime = await mod.createControlRuntime({
-    configPath: path.join(dir, "config.json"),
-    controlStatePath: path.join(dir, "control-state.json"),
+    ...isolatedProductOptions(env),
+    configPath: env.configPath,
+    controlStatePath: env.controlStatePath,
   });
-  runtime.__dir = dir;
+  runtime.__dir = env.stateRoot;
+  runtime.__env = env;
   return runtime;
 }
 
@@ -40,35 +43,8 @@ async function withRuntime(run: (runtime: any) => Promise<void>): Promise<void> 
     await run(runtime);
   } finally {
     await runtime.stop().catch(() => {});
-    fs.rmSync(runtime.__dir, { recursive: true, force: true });
+    runtime.__env.cleanup();
   }
-}
-
-/** Establish a browser session and return cookie + CSRF token credentials. */
-async function establishSession(baseUrl: string): Promise<{ cookie: string; csrf: string }> {
-  const sessionResponse = await fetch(`${baseUrl}/api/v1/session`);
-  const setCookie = sessionResponse.headers.get("set-cookie") ?? "";
-  const cookie = setCookie.split(";")[0] ?? "";
-  const body = (await sessionResponse.json()) as { csrf_token?: string };
-  return { cookie, csrf: body.csrf_token ?? "" };
-}
-
-async function mutatingRequest(
-  baseUrl: string,
-  path: string,
-  body: unknown,
-  auth: { cookie?: string; csrf?: string; origin?: string } = {},
-): Promise<Response> {
-  return fetch(`${baseUrl}${path}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(auth.cookie ? { cookie: auth.cookie } : {}),
-      ...(auth.csrf ? { "x-csrf-token": auth.csrf } : {}),
-      ...(auth.origin ? { origin: auth.origin } : {}),
-    },
-    body: JSON.stringify(body),
-  });
 }
 
 describe("SEC — control plane security", () => {
@@ -124,24 +100,30 @@ describe("SEC — control plane security", () => {
   it("SEC-004 rejects privileged mutations without valid CSRF/session proof, state unchanged", async () => {
     await withRuntime(async (runtime) => {
       const session = await establishSession(runtime.baseUrl);
+      const origin = runtime.baseUrl; // valid same-origin for every probe
       const mutationFamilies: { path: string; body: unknown }[] = [
         { path: "/api/v1/workspaces", body: { root: "/tmp/sec004-never" } },
         { path: "/api/v1/settings", body: { startAtLogin: true } },
         { path: "/api/v1/connection/connect", body: {} },
       ];
       for (const family of mutationFamilies) {
-        // No cookie at all.
+        // Variable-isolated rejections: every probe carries a VALID Origin so
+        // an implementation that only checks Origin cannot pass this contract.
+        // 1) valid Origin + valid CSRF + missing session.
         const noSession = await mutatingRequest(runtime.baseUrl, family.path, family.body, {
+          origin,
           csrf: session.csrf,
         });
         expect(noSession.status).toBeGreaterThanOrEqual(400);
-        // Session but missing CSRF token.
+        // 2) valid Origin + valid session + missing CSRF token.
         const noCsrf = await mutatingRequest(runtime.baseUrl, family.path, family.body, {
+          origin,
           cookie: session.cookie,
         });
         expect(noCsrf.status).toBeGreaterThanOrEqual(400);
-        // Session but invalid CSRF token.
+        // 3) valid Origin + valid session + invalid CSRF token.
         const badCsrf = await mutatingRequest(runtime.baseUrl, family.path, family.body, {
+          origin,
           cookie: session.cookie,
           csrf: "invalid-token",
         });
@@ -198,10 +180,20 @@ describe("SEC — control plane security", () => {
         runtime.baseUrl,
         "/api/v1/workspaces",
         { root: "/tmp/sec007", note: oversized },
-        { cookie: session.cookie, csrf: session.csrf, origin: runtime.baseUrl },
+        {
+          cookie: session.cookie,
+          csrf: session.csrf,
+          origin: runtime.baseUrl,
+        },
       );
       expect(response.status).toBeGreaterThanOrEqual(400);
       expect(response.status).toBeLessThan(500);
+      // State unchanged: the rejected oversized request must not have
+      // authorized anything or mutated configuration.
+      const list = await fetch(`${runtime.baseUrl}/api/v1/workspaces`, {
+        headers: { cookie: session.cookie },
+      });
+      expect((await list.json()) as any).toMatchObject({ workspaces: [] });
     });
   });
 
@@ -283,12 +275,12 @@ describe("SEC — control plane security", () => {
       for (const surface of surfaces) {
         expect(surface).not.toContain(SENTINEL_SECRET);
       }
-      // Persisted normal config and control state hold no secret either.
-      for (const file of ["config.json", "control-state.json"]) {
-        const filePath = path.join(runtime.__dir, file);
-        if (fs.existsSync(filePath)) {
-          expect(fs.readFileSync(filePath, "utf8")).not.toContain(SENTINEL_SECRET);
-        }
+      // Persisted normal config/control-state hold no secret either: scan
+      // every artifact the product wrote into the isolated state root.
+      assertNoRealUserState(runtime.__env);
+      for (const relative of runtime.__env.listStateRootFiles()) {
+        const content = runtime.__env.readStateFile(relative) ?? "";
+        expect(content).not.toContain(SENTINEL_SECRET);
       }
     });
   });

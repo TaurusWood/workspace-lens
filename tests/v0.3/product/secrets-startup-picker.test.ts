@@ -1,7 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { importExpected } from "../helpers/expected-module.js";
+import { assertNoRealUserState, createIsolatedProductEnv, isolatedProductOptions } from "../helpers/isolated-env.js";
 
 /**
  * Secret, Startup, and Folder Picker Adapter Contracts
@@ -13,32 +12,63 @@ const SENTINEL = "SECRET_AUTO_SENTINEL_pl48xw";
 
 describe("SECRET — secret store contracts", () => {
   it("SECRET-001 stores the credential outside ordinary config and control state", async () => {
-    const { SecretStore } = await importExpected("secretStore");
-    const dir = fs.mkdtempSync(path.join(import.meta.dirname, ".secret-"));
+    // Full credential setup through the real product path (Control API) in
+    // an isolated product environment, then inspect EVERY artifact the
+    // product persisted — not files the test invented.
+    const { createControlRuntime } = await importExpected("controlServer");
+    const env = createIsolatedProductEnv("secret001");
+    let runtime: any;
     try {
-      const store = new SecretStore({ namespace: "workspace-lens-v0.3-secret001" });
-      await store.set("runtime-key", SENTINEL);
-      // After credential setup, ordinary WorkspaceLens config/control state
-      // must not contain the literal secret.
-      const ordinaryFiles = [
-        path.join(dir, "config.json"),
-        path.join(dir, "control-state.json"),
-      ].filter((file) => fs.existsSync(file));
-      for (const file of ordinaryFiles) {
-        expect(fs.readFileSync(file, "utf8")).not.toContain(SENTINEL);
+      runtime = await createControlRuntime({
+        ...isolatedProductOptions(env),
+        configPath: env.configPath,
+        controlStatePath: env.controlStatePath,
+      });
+      const { establishSession, apiRequest } = await import("../helpers/control-api.js");
+      const session = await establishSession(runtime.baseUrl);
+      const setup = await apiRequest(
+        runtime.baseUrl,
+        "/api/v1/credentials",
+        { runtimeApiKey: SENTINEL },
+        { cookie: session.cookie, csrf: session.csrf, origin: runtime.baseUrl },
+      );
+      expect([200, 201]).toContain(setup.status);
+      const setupBody = JSON.stringify(await setup.json());
+      expect(setupBody).not.toContain(SENTINEL);
+
+      // The isolated state root is the product's real persistence location
+      // for this run: no artifact inside it may contain the literal secret.
+      assertNoRealUserState(env);
+      const persisted = env.listStateRootFiles();
+      expect(persisted.length).toBeGreaterThan(0);
+      for (const relative of persisted) {
+        expect(env.readStateFile(relative) ?? "").not.toContain(SENTINEL);
       }
-      // Reading back through the store works (and the value never gets
-      // printed by the test).
-      expect(await store.get("runtime-key")).toBe(SENTINEL);
-      await store.delete("runtime-key");
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      await runtime?.stop?.().catch(() => {});
+      env.cleanup();
     }
   });
 
   it("SECRET-002 reports an unavailable store as action-required without plaintext fallback", async () => {
     const { SecretStore } = await importExpected("secretStore");
-    const store = new SecretStore({ namespace: "workspace-lens-v0.3-secret002", forceUnavailable: true });
+    // Deterministically unavailable platform seam; never the host keychain.
+    const failingPlatform = {
+      available: async () => false,
+      get: async () => {
+        throw new Error("credential store unavailable");
+      },
+      set: async () => {
+        throw new Error("credential store unavailable");
+      },
+      delete: async () => {
+        throw new Error("credential store unavailable");
+      },
+    };
+    const store = new SecretStore({
+      namespace: "workspace-lens-v0.3-secret002",
+      platform: failingPlatform,
+    });
     const available = await store.available();
     expect(available).toBe(false);
     // The operation must fail rather than create a plaintext fallback file.

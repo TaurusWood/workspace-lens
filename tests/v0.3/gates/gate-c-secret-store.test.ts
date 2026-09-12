@@ -1,5 +1,7 @@
+import fs from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { MissingCapabilityError, importExpected } from "../helpers/expected-module.js";
+import { MissingCapabilityError, importExpected, isModuleImplemented } from "../helpers/expected-module.js";
 
 /**
  * GATE-C — SecretStore feasibility on Node 24
@@ -9,14 +11,18 @@ import { MissingCapabilityError, importExpected } from "../helpers/expected-modu
  * OS-backed secret store without plaintext fallback and without making
  * installation impractical?
  *
- * GATE-C-1 (candidate install/build on Node 24) is BLOCKED in this phase:
- * no candidate dependency has been accepted yet, and adding a native
- * dependency (e.g. @github/keytar or an alternative OS-backed adapter) is a
- * production dependency decision that requires the Gate C dependency review
- * before the harness may exercise it. The interface contracts below
- * (GATE-C-2/3) are expressed as executable tests that activate when
- * `src/integrations/secrets/secret-store.ts` exists (Slice 10) — they are
- * RED now, not skipped, and must never print the literal secret.
+ * GATE-C-1 is BLOCKED in this phase: no candidate OS-credential dependency
+ * has been accepted yet, and adding a native dependency (e.g. @github/keytar
+ * or an alternative OS-backed adapter) requires the Gate C dependency review
+ * before the harness may exercise it. The gate test records that evidence and
+ * — once `src/integrations/secrets/secret-store.ts` exists (Slice 10) — runs
+ * REAL feasibility assertions (declared dependency on Node 24, adapter
+ * importable and instantiable) instead of auto-passing.
+ *
+ * GATE-C-2/3 are executable interface contracts: set/get/delete in an
+ * isolated namespace without printing the secret, and a deterministically
+ * injected unavailable-store platform (no reliance on the host OS state)
+ * proving action-required behavior with no plaintext fallback.
  */
 
 const GATE_C_BLOCKED_EVIDENCE =
@@ -28,20 +34,39 @@ const GATE_C_BLOCKED_EVIDENCE =
   "the SecretStore interface after dependency review, then re-run this gate; " +
   "(b) narrow initial OS support explicitly. Plaintext automatic fallback remains forbidden.";
 
+function assertNode24Engine(): void {
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(import.meta.dirname, "../../../package.json"), "utf8"),
+  ) as { engines?: { node?: string } };
+  expect(pkg.engines?.node).toBe(">=24 <25");
+  const [major] = process.versions.node.split(".").map((part) => Number.parseInt(part, 10));
+  expect(major).toBe(24);
+}
+
 describe("GATE-C SecretStore feasibility on Node 24", () => {
-  it("GATE-C-1 records BLOCKED evidence for the candidate dependency decision", async () => {
-    // The gate must fail with explicit evidence, never silently pass.
-    expect.assertions(2);
-    try {
-      await importExpected("secretStore");
-      // If the module suddenly exists (Slice 10 landed), the gate is no
-      // longer blocked: it must run the real adapter feasibility tests.
-      expect(true).toBe(true);
-    } catch (error) {
-      expect(error).toBeInstanceOf(MissingCapabilityError);
+  it("GATE-C-1 verifies candidate feasibility once a store adapter exists; records BLOCKED evidence before", async () => {
+    if (!isModuleImplemented("secretStore")) {
+      // BLOCKED with evidence — the gate fails until the dependency decision
+      // is made and Slice 10 lands; it never silently passes.
+      expect(GATE_C_BLOCKED_EVIDENCE).toContain("BLOCKED");
+      expect(GATE_C_BLOCKED_EVIDENCE).toContain("no OS credential-store");
+      throw new MissingCapabilityError(GATE_C_BLOCKED_EVIDENCE);
     }
-    // Document the blocker for the coverage matrix and reviewers.
-    expect(GATE_C_BLOCKED_EVIDENCE).toContain("BLOCKED");
+    // Feasibility assertions that only run against the real adapter.
+    assertNode24Engine();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dirname, "../../../package.json"), "utf8"),
+    ) as {
+      dependencies?: Record<string, string>;
+    };
+    const dependencyNames = Object.keys(pkg.dependencies ?? {});
+    // An OS-backed store implementation must actually be declared as a
+    // production dependency (install/build on Node 24 is part of the gate).
+    expect(dependencyNames.length).toBeGreaterThan(1);
+    const mod = await importExpected("secretStore");
+    const store = new mod.SecretStore({ namespace: "workspace-lens-v0.3-gate-c-feasibility" });
+    // Instantiation and availability probing must not throw on Node 24.
+    await expect(store.available()).resolves.toEqual(expect.any(Boolean));
   });
 
   it("GATE-C-2 performs set/get/delete in an isolated test key without printing the secret", async () => {
@@ -62,27 +87,32 @@ describe("GATE-C SecretStore feasibility on Node 24", () => {
     }
   });
 
-  it("GATE-C-3 reports an unavailable store as action-required, never plaintext fallback", async () => {
+  it("GATE-C-3 reports a deterministically unavailable store as action-required, never plaintext fallback", async () => {
     const { SecretStore } = await importExpected("secretStore");
-    const store = new SecretStore({ namespace: "workspace-lens-v0.3-gate-c-unavailable" });
-    const available = await store.available();
-    if (!available) {
-      // An unavailable store must surface an explicit action-required state,
-      // and setting a secret must fail rather than silently storing plaintext.
-      await expect(
-        store.set("workspace-lens-unavailable-probe", "GATE_C_SENTINEL_SHOULD_NOT_PERSIST"),
-      ).rejects.toThrow();
-      return;
-    }
-    // With a healthy store, v0.3 must still never create a plaintext
-    // fallback file for the same credential name.
-    const secretName = "workspace-lens-test-runtime-key";
-    const secretValue = `GATE_C_SENTINEL_${Date.now()}_fallback`;
-    try {
-      await store.set(secretName, secretValue);
-      expect(await store.get(secretName)).toBe(secretValue);
-    } finally {
-      await store.delete(secretName).catch(() => {});
-    }
+    // The unavailable platform is injected deterministically — the contract
+    // must not depend on whether the host OS happens to have a keychain.
+    const failingPlatform = {
+      available: async () => false,
+      get: async () => {
+        throw new Error("credential store unavailable");
+      },
+      set: async () => {
+        throw new Error("credential store unavailable");
+      },
+      delete: async () => {
+        throw new Error("credential store unavailable");
+      },
+    };
+    const store = new SecretStore({
+      namespace: "workspace-lens-v0.3-gate-c-unavailable",
+      platform: failingPlatform,
+    });
+    expect(await store.available()).toBe(false);
+    // Setting a secret must fail explicitly rather than silently storing
+    // plaintext anywhere.
+    await expect(
+      store.set("workspace-lens-unavailable-probe", "GATE_C_SENTINEL_SHOULD_NOT_PERSIST"),
+    ).rejects.toThrow();
+    expect(await store.get("workspace-lens-unavailable-probe")).toBeUndefined();
   });
 });

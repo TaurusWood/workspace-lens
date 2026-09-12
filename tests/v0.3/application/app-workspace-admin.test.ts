@@ -125,7 +125,7 @@ describe("APP — workspace administration through the shared application servic
     }
   });
 
-  it("APP-004 disables immediately and re-enabling revalidates the existing root", async () => {
+  it("APP-004 disables immediately; re-enabling revalidates the existing root", async () => {
     const workspace = makePlainWorkspace("app004");
     const configPath = newConfigFile();
     try {
@@ -139,19 +139,41 @@ describe("APP — workspace administration through the shared application servic
       // Disabled workspace is unavailable to subsequent MCP content
       // operations: a registry built from the current config must reject it.
       const { WorkspaceRegistry } = await import("../../../src/core/workspace-registry.js");
-      const registry = new WorkspaceRegistry(new ConfigStore(configPath).load());
-      expect(() => registry.requireEnabled(added.workspace_id)).toThrow(/disabled/i);
+      const registryOf = () => new WorkspaceRegistry(new ConfigStore(configPath).load());
+      expect(() => registryOf().requireEnabled(added.workspace_id)).toThrow(/disabled/i);
 
-      // Re-enable revalidates the existing root without modifying it.
+      // Re-enabling must REVALIDATE the root, not just flip the flag: with
+      // the root gone, enable must fail (or leave the workspace unavailable)
+      // — silently enabling a missing root would fail the contract.
+      fs.rmSync(workspace.root, { recursive: true, force: true });
+      type EnableOutcome = "rejected" | "kept-disabled" | "wrongly-enabled";
+      let outcome: EnableOutcome;
+      try {
+        await service.enable(added.workspace_id);
+        const afterBlindEnable = service
+          .list()
+          .find((ws: any) => ws.workspace_id === added.workspace_id) as any;
+        outcome = afterBlindEnable.enabled === false ? "kept-disabled" : "wrongly-enabled";
+      } catch {
+        outcome = "rejected"; // acceptable variant: enable rejected outright
+      }
+      expect(outcome).not.toBe("wrongly-enabled");
+
+      // Once the root exists again, enabling succeeds and revalidates.
+      fs.mkdirSync(workspace.root, { recursive: true });
+      fs.writeFileSync(path.join(workspace.root, workspace.sentinelFile), workspace.sentinelContent);
       await service.enable(added.workspace_id);
       const enabled = service.list().find((ws: any) => ws.workspace_id === added.workspace_id) as any;
       expect(enabled.enabled).toBe(true);
       expect(enabled.root).toBe(workspace.root);
+      // The revalidated registry view serves the workspace again.
+      expect(registryOf().isAvailable(registryOf().findById(added.workspace_id)!)).toBe(true);
+      // No user workspace file was modified by the revalidation.
       expect(
         fs.readFileSync(path.join(workspace.root, workspace.sentinelFile), "utf8"),
       ).toBe(workspace.sentinelContent);
     } finally {
-      cleanupWorkspace(workspace);
+      fs.rmSync(workspace.root, { recursive: true, force: true });
       fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
     }
   });

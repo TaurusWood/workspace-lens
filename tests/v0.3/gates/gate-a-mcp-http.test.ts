@@ -1,6 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
@@ -12,6 +11,7 @@ import { WorkspaceRegistry } from "../../../src/core/workspace-registry.js";
 import type { Logger } from "../../../src/core/logger.js";
 import { createToolContext, createWorkspaceLensServer } from "../../../src/mcp/server.js";
 import { cleanupWorkspace, makeConfig, makePlainWorkspace, type WorkspaceFixture } from "../helpers/mcp.js";
+import { spawnServe } from "../helpers/spawn-cli.js";
 
 const SILENT_LOGGER: Logger = {
   toolCall: () => {},
@@ -147,16 +147,11 @@ describe("GATE-A Streamable HTTP MCP parity", () => {
   });
 
   it("GATE-A-2 keeps stdio/HTTP semantic parity for representative operations", async () => {
-    // stdio-envelope side: the SDK's in-memory transport shares the JSON-RPC
-    // protocol layer with stdio, connected to the same server factory. The
-    // real stdio *process* path is separately proven by REG-003.
+    // stdio side: the REAL `workspace-lens serve` child process (the exact
+    // stdio transport product clients use), pinned to the same workspace
+    // fixture via an isolated config.
     const config = makeConfig([{ id: "gate-a-ws", name: "gate-a", root: workspace.root, enabled: true }]);
-    const registry = new WorkspaceRegistry(config);
-    const server = createWorkspaceLensServer(createToolContext({ registry }));
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const stdioClient = new Client({ name: "v0.3-gate-a-stdio-client", version: "0.0.0" });
-    await Promise.all([server.connect(serverTransport), stdioClient.connect(clientTransport)]);
-
+    const serve = await spawnServe(config);
     const httpClient = await connectHttpClient(httpMcp.url);
     try {
       // Representative operation set: list, one filesystem read, one Git
@@ -168,7 +163,7 @@ describe("GATE-A Streamable HTTP MCP parity", () => {
         { name: "read_file", args: { workspace_id: "gate-a-ws", path: "does/not/exist.txt" } },
       ];
       for (const operation of operations) {
-        const viaStdio = await stdioClient.callTool({ name: operation.name, arguments: operation.args });
+        const viaStdio = await serve.client.callTool({ name: operation.name, arguments: operation.args });
         const viaHttp = await httpClient.callTool({ name: operation.name, arguments: operation.args });
         // Meaningful structured results must not fork between transports:
         // same error/success outcome, same payload content.
@@ -176,8 +171,8 @@ describe("GATE-A Streamable HTTP MCP parity", () => {
         expect(JSON.stringify(viaHttp)).toBe(JSON.stringify(viaStdio));
       }
     } finally {
-      await stdioClient.close();
       await httpClient.close();
+      await serve.close();
     }
   });
 

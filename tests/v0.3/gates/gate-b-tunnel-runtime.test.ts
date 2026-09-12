@@ -19,7 +19,10 @@ import { describe, expect, it } from "vitest";
  * Gate B.
  */
 
-const SENTINEL_SECRET = "WL_GATE_B_SENTINEL_SECRET_9x7q";
+const RUNTIME_KEY_ENV_NAME = "WL_GATE_B_RUNTIME_KEY";
+// The literal secret VALUE is what must never leak; the argv carries only
+// the env: reference to it.
+const RUNTIME_KEY_LITERAL = `super-secret-random-sentinel-${process.pid}-${Date.now()}-abc123`;
 const SENTINEL_ADMIN = "WL_GATE_B_SENTINEL_ADMIN_4k2m";
 
 interface BinaryEvidence {
@@ -134,43 +137,53 @@ describe("GATE-B official tunnel-client managed runtime contract", () => {
     expect(fixture).toContain("is not known; run create or connect first");
   });
 
-  it("GATE-B-3 proves secret references stay out of argv/output on the offline connect path", () => {
+  it("GATE-B-3 proves the literal secret value never leaks while argv carries only the env reference", () => {
     requireBinary();
     const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "wl-gate-b-profile-"));
     try {
       // Drive the connect path as far as an unreachable control plane
       // (127.0.0.1:1 refuses immediately; no remote call is possible and no
       // remote state is created).
-      const result = runTunnelClient(
-        [
-          "runtimes",
-          "connect",
-          "--alias",
-          `wl-gate-b-secret-${process.pid}`,
-          "--mcp-server-url",
-          "http://127.0.0.1:59999/mcp",
-          "--runtime-api-key",
-          `env:${SENTINEL_SECRET}`,
-          "--organization-id",
-          "wl-gate-b-probe-org",
-          "--control-plane-base-url",
-          "http://127.0.0.1:1",
-          "--profile-dir",
-          profileDir,
-          "--json",
-        ],
-        { OPENAI_ADMIN_KEY: `env:${SENTINEL_ADMIN}` },
-      );
+      const constructedArgv = [
+        "runtimes",
+        "connect",
+        "--alias",
+        `wl-gate-b-secret-${process.pid}`,
+        "--mcp-server-url",
+        "http://127.0.0.1:59999/mcp",
+        "--runtime-api-key",
+        `env:${RUNTIME_KEY_ENV_NAME}`,
+        "--organization-id",
+        "wl-gate-b-probe-org",
+        "--control-plane-base-url",
+        "http://127.0.0.1:1",
+        "--profile-dir",
+        profileDir,
+        "--json",
+      ];
+      // The child can resolve the reference: the env var holds the LITERAL
+      // value, the argv holds only the reference.
+      const result = runTunnelClient(constructedArgv, {
+        [RUNTIME_KEY_ENV_NAME]: RUNTIME_KEY_LITERAL,
+        OPENAI_ADMIN_KEY: `env:${SENTINEL_ADMIN}`,
+      });
       expect(result.status).not.toBe(0);
-      // The literal secret material must never appear in argv echo, stdout,
-      // stderr, or files generated so far.
-      expect(result.stdout).not.toContain(SENTINEL_SECRET);
-      expect(result.stderr).not.toContain(SENTINEL_SECRET);
+
+      // Argv contract: the reference is present, the literal value is not.
+      const argvText = constructedArgv.join(" ");
+      expect(argvText).toContain(`env:${RUNTIME_KEY_ENV_NAME}`);
+      expect(argvText).not.toContain(RUNTIME_KEY_LITERAL);
+
+      // No literal secret value anywhere the child could echo it.
+      expect(result.stdout).not.toContain(RUNTIME_KEY_LITERAL);
+      expect(result.stderr).not.toContain(RUNTIME_KEY_LITERAL);
       expect(result.stdout).not.toContain(SENTINEL_ADMIN);
       expect(result.stderr).not.toContain(SENTINEL_ADMIN);
       const generated = fs.readdirSync(profileDir);
       for (const file of generated) {
-        expect(fs.readFileSync(path.join(profileDir, file), "utf8")).not.toContain(SENTINEL_SECRET);
+        expect(fs.readFileSync(path.join(profileDir, file), "utf8")).not.toContain(
+          RUNTIME_KEY_LITERAL,
+        );
       }
     } finally {
       fs.rmSync(profileDir, { recursive: true, force: true });

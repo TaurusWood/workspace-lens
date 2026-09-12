@@ -161,7 +161,9 @@ fs.writeFileSync(outFile, JSON.stringify({ reads, parseFailures }));
     const workspaceA = makePlainWorkspace("cfg004a");
     const workspaceB = makePlainWorkspace("cfg004b");
     try {
-      // Actor A (child process) reads, then pauses at the gate...
+      // Actor A (child process) reads the config into a stale in-memory view
+      // and signals readiness (read completes BEFORE the gate, see
+      // spawn-mutation.ts)...
       const childA = spawnMutationChild(configPath, { tag: "stale-a", root: workspaceA.root, id: "cfg004-a" }, gateDir);
       await childA.ready;
       // ...while actor B (this process) completes a newer accepted change.

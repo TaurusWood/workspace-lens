@@ -67,6 +67,28 @@ export class MissingCapabilityError extends Error {
   }
 }
 
+/**
+ * Import an expected module by repo-relative path (no leading slash), failing
+ * RED until it exists. Used for surfaces outside `src/` — e.g. the WebUI
+ * component test harness the UI contracts mount through
+ * `ui/test-support/index.ts`.
+ */
+export async function importExpectedPath(
+  repoRelativePath: string,
+  capability: string,
+  ownerSlice: string,
+): Promise<any> {
+  const absolute = path.join(REPO_ROOT, repoRelativePath);
+  if (!fs.existsSync(absolute)) {
+    throw new MissingCapabilityError(
+      `v0.3 RED (missing capability): ${capability} is not implemented yet (${ownerSlice}); ` +
+        `expected module ${repoRelativePath} does not exist. Behavioral assertions activate ` +
+        `once the module exists. See docs/v0.3-test-coverage.md.`,
+    );
+  }
+  return import(/* @vite-ignore */ absolute);
+}
+
 export function modulePath(key: ExpectedModuleKey): string {
   return path.join(SRC_ROOT, EXPECTED_MODULES[key]);
 }

@@ -73,6 +73,13 @@ try {
     process.exit(${CHILD_EXIT_MODULE_MISSING});
   }
   const service = new WorkspaceAdminService({ configStore: new ConfigStore(${JSON.stringify(configPath)}) });
+  // Read phase BEFORE signaling readiness: each child holds a stale in-memory
+  // view of the config at gate time. This forces the mutation windows of all
+  // children to overlap deterministically (CFG-001) and gives CFG-004 a real
+  // stale-snapshot actor: any implementation that writes a whole stale config
+  // back will now lose the concurrent change and fail the contract.
+  const staleView = service.list();
+  if (!Array.isArray(staleView)) { console.error("CHILD_ERROR: service.list() did not return a list"); process.exit(1); }
   fs.writeFileSync(readyFile, String(process.pid));
   const deadline = Date.now() + 30000;
   while (!fs.existsSync(goFile)) {
