@@ -7,17 +7,18 @@ This document defines the intended product scope for WorkspaceLens v0.2 through 
 The purpose of these versions is to improve review completeness and daily usability without changing the core product model:
 
 ```text
-Reasoning Chat
-      |
-      | safe read-only context
-      v
+Reasoning Chat / Project
+        |
+        | safe read-only context
+        v
 WorkspaceLens
-      |
-      v
-Authorized Local Workspace
-      ^
-      |
-Zcode / Codex / Claude Code / IDE / Human
+        |
+        | one service, many authorized workspaces
+        v
+Authorized Local Workspaces
+        ^
+        |
+Codex / Claude Code / Zcode / IDE / Human
 ```
 
 The durable boundaries remain:
@@ -29,6 +30,7 @@ The durable boundaries remain:
 - WorkspaceLens does not orchestrate agents.
 - Reviewer -> Builder handoff remains user-controlled.
 - No generic shell or arbitrary Git command passthrough is introduced.
+- WorkspaceLens is optimized for reasoning-dense inspection loops, not execution-dense coding loops.
 
 ## 1. Version Strategy
 
@@ -41,16 +43,16 @@ v0.1  Core technical path proven
 v0.2  Complete the core review context + setup documentation
   |
   v
-v0.3  Local productization: Local Control Service + WebUI
+v0.3  Local Context Control Plane: WebUI + onboarding + multi-workspace lifecycle
   |
   v
-v0.4  ChatGPT Project / workspace interaction convention
+v0.4  Workspace targeting + MCP observability
   |
   v
-v0.5  Reviewer behavior + development-flow composition
+v0.5  Reasoning workflow composition without orchestration
 ```
 
-The largest expected engineering effort is v0.3. v0.2, v0.4, and v0.5 should remain deliberately narrower and must not be allowed to expand into adjacent platform or orchestration work.
+The largest expected engineering effort remains v0.3. v0.4 and v0.5 should stay deliberately narrower and must not expand WorkspaceLens into a chat manager, workflow engine, coding harness, or general-purpose MCP runtime.
 
 ---
 
@@ -169,15 +171,32 @@ v0.2 is complete when:
 
 ---
 
-# 3. v0.3 — Local Productization with WebUI
+# 3. v0.3 — Local Context Control Plane
 
 ## Goal
 
-Turn WorkspaceLens from a command-line setup that a user can make work into a local tool that an ordinary developer can configure once and keep available for daily use.
+Turn WorkspaceLens from a command-line setup that a user can make work into a local context service that a developer configures once and can keep available for daily reasoning work.
 
-v0.3 is expected to contain the largest engineering effort in this roadmap.
+v0.3 is the main productization release in this roadmap.
 
-The preferred product shape is:
+The core product model is:
+
+```text
+ChatGPT / Reasoning Clients
+           |
+           | one WorkspaceLens app / MCP connection
+           v
+WorkspaceLens Local Service
+           |
+           +--> Workspace A
+           +--> Workspace B
+           +--> Workspace C
+           `--> Workspace N
+```
+
+A normal multi-project setup SHOULD use one WorkspaceLens service and one provider connection exposing multiple explicitly authorized workspaces. WorkspaceLens MUST NOT require a separate MCP server, tunnel, or ChatGPT app per workspace by default.
+
+The preferred local product shape is:
 
 ```text
 Browser
@@ -186,7 +205,7 @@ Browser
    v
 WorkspaceLens Local Control Service (Node.js)
    |                |
-   |                +--> Provider integration / tunnel lifecycle
+   |                +--> provider integration / tunnel lifecycle
    |
    +--> shared application services
             |
@@ -197,7 +216,7 @@ WorkspaceLens Local Control Service (Node.js)
    Authorized Workspaces
 ```
 
-The WebUI is a local control surface. It is not a hosted web product, chat interface, IDE, or code browser.
+The WebUI is the control plane for local context connectivity. It is not a hosted web product, chat interface, IDE, code browser, or AI workflow manager.
 
 ## 3.1 Product Decision: WebUI before Electron/native GUI
 
@@ -217,7 +236,7 @@ This is a product direction, not permission to build a general-purpose web platf
 
 The WebUI requires a local control service. v0.3 should therefore be treated as `Local Control Service + WebUI`, not merely a set of static pages.
 
-The Local Control Service should own product-level local operations required by the UI, while reusing the same underlying application services as the CLI.
+The Local Control Service should own product-level local operations required by the UI while reusing the same underlying application services as the CLI.
 
 The GUI/WebUI MUST NOT create a second configuration model or duplicate business rules already used by the CLI/Core.
 
@@ -235,9 +254,9 @@ WebUI / Local Control Service
 
 The UI must not implement workspace authorization logic independently from the existing configuration/security layer.
 
-## 3.3 Minimum WebUI responsibilities
+## 3.3 Minimum WebUI Responsibilities
 
-The initial WebUI should be intentionally small.
+The initial WebUI should remain intentionally small.
 
 ### Workspace management
 
@@ -245,27 +264,26 @@ The user can:
 
 - view all configured workspaces;
 - add a local workspace through a folder-selection flow appropriate to the platform/runtime;
-- see workspace name and enabled state;
+- see its stable logical name/identity and local root;
+- see enabled/disabled and validation state;
 - enable or disable a workspace;
 - remove a workspace authorization;
-- see clear validation errors for invalid or inaccessible roots.
+- see clear errors for invalid or inaccessible roots.
 
-The UI should not expose opaque IDs unless needed for diagnostics.
+Opaque internal IDs should not be the primary user-facing identity unless required for diagnostics.
 
-### Local service status
+### Local service and connection status
 
-The user can see whether the WorkspaceLens local service is healthy and whether the configuration is valid.
+The user can see whether:
 
-### ChatGPT / tunnel integration status
+- WorkspaceLens local service is healthy;
+- configuration is valid;
+- provider integration is configured or not configured;
+- the official tunnel client is available or unavailable;
+- the tunnel process is running or stopped;
+- tunnel health is healthy/unhealthy where this can be verified reliably.
 
-The user can see product-relevant provider integration state, such as:
-
-- integration configured / not configured;
-- official tunnel client available / unavailable;
-- tunnel process running / stopped;
-- tunnel connection healthy / unhealthy where this can be verified reliably.
-
-The UI must not claim that a specific ChatGPT conversation is connected unless WorkspaceLens can actually verify that fact.
+The UI MUST NOT claim that a particular ChatGPT conversation, Project, or message is connected unless WorkspaceLens can actually verify that fact.
 
 ### Tunnel lifecycle
 
@@ -288,9 +306,13 @@ The user should have a simple diagnostic view that can identify at least:
 
 A copyable diagnostics summary is desirable if it can be implemented without exposing secrets.
 
-## 3.4 First-time onboarding
+A small live status surface MAY expose factual runtime information such as active request count, last request time, last error, or current tunnel state. Historical activity analysis is deferred to v0.4.
 
-The target onboarding flow is conceptually:
+## 3.4 Guided Onboarding and Ownership Boundary
+
+v0.3 should convert the current documentation-driven setup into a state-driven onboarding experience while preserving explicit ownership boundaries.
+
+The target flow is:
 
 ```text
 Start WorkspaceLens
@@ -299,38 +321,74 @@ Start WorkspaceLens
 Open local WebUI
       |
       v
+Check local prerequisites
+      |
+      v
 Authorize workspace(s)
       |
       v
-Configure ChatGPT connection
+Configure local tunnel profile
       |
       v
-Complete provider-owned browser/account step if required
+Guide provider-owned account / ChatGPT steps
       |
       v
-Connection check
+Verify local connection state
       |
       v
 Ready
 ```
 
-The user should not need to understand MCP transport internals, tunnel profile files, tunnel IDs, local ports, or process supervision beyond information that the provider requires them to supply directly.
+WorkspaceLens-owned steps may be automated by the WebUI.
 
-Where OpenAI requires explicit account-side configuration, WorkspaceLens should guide the user to that step rather than attempting to replace or automate an unsupported provider workflow.
+Provider-owned steps that require the user's OpenAI/ChatGPT account, such as creating provider resources, enabling provider features, creating/selecting the ChatGPT app/connection, or refreshing/scanning tools, should be guided rather than simulated or browser-automated.
 
-## 3.5 Daily-use target
+The WebUI should make these states explicit, for example:
 
-After successful onboarding, normal daily review should not require the user to re-run a sequence of setup commands.
+```text
+Local prerequisites      Ready
+Workspace configuration  Ready
+Tunnel profile           Ready
+Provider account setup   Action required
+ChatGPT app setup        Action required
+Connection               Waiting / Healthy
+```
+
+The user should not need to understand MCP transport internals, tunnel profile files, local ports, or process supervision beyond information that the provider explicitly requires them to supply.
+
+## 3.5 Workspace Identity and Optional Reasoning Helpers
+
+Each workspace should have a stable, visible logical identity suitable for use in reasoning environments.
+
+The WebUI MAY provide convenience actions for a selected workspace such as:
+
+- `Copy Project Instructions`;
+- `Copy Review Prompt`;
+- `Copy Plan Prompt`.
+
+These are optional bootstrap helpers only.
+
+They MUST NOT create workflow state, define mandatory interaction steps, or become a prompt-management product. A user or repository may instead use Project Instructions, `AGENTS.md`, a review/plan skill, `development-flow`, or another reasoning convention.
+
+`Copy Project Instructions` should identify the preferred workspace explicitly and instruct the reasoning client not to guess when the workspace is unavailable or ambiguous.
+
+## 3.6 Daily-use Target
+
+After successful onboarding, normal daily use should not require the user to re-run setup commands or create new provider connections for each project.
 
 The target experience is:
 
 ```text
-Open reasoning chat
-    -> ask about an authorized workspace
-    -> WorkspaceLens is already available
+Login / machine start
+      -> WorkspaceLens and integration become available
+      -> open reasoning chat / Project
+      -> ask about an authorized workspace
+      -> WorkspaceLens serves current local context
 ```
 
-## 3.6 Autostart / persistent availability
+Adding another local project should normally mean authorizing another workspace in the WebUI, not creating another MCP server or tunnel.
+
+## 3.7 Autostart / Persistent Availability
 
 Persistent availability is part of the v0.3 product goal, but the implementation should remain minimal and platform-aware.
 
@@ -343,7 +401,7 @@ Requirements:
 
 A macOS-first implementation is acceptable if cross-platform startup handling would materially delay the release. Core, CLI, configuration, and WebUI contracts should remain portable.
 
-## 3.7 Local WebUI security requirements
+## 3.8 Local WebUI Security Requirements
 
 A local browser UI introduces a new control surface and therefore requires an explicit security contract.
 
@@ -359,7 +417,20 @@ At minimum:
 
 `localhost-only` is necessary but is not, by itself, a complete browser security model.
 
-## 3.8 CLI compatibility
+## 3.9 Multi-workspace Concurrency and Isolation
+
+A single WorkspaceLens service may receive concurrent requests for different authorized workspaces from different chats or reasoning clients.
+
+Therefore:
+
+- every content-bearing operation MUST resolve access from an explicit workspace identity;
+- WorkspaceLens MUST NOT maintain a mutable global `current workspace` or `recent workspace` that changes MCP behavior;
+- filesystem roots, Git working directories, access-policy evaluation, output bounds, and errors MUST remain request/workspace scoped;
+- concurrent requests targeting different workspaces MUST NOT leak or cross-contaminate state.
+
+v0.3 should include automated concurrency/isolation coverage for multiple workspaces.
+
+## 3.10 CLI Compatibility
 
 The CLI remains a supported interface for advanced users and automation.
 
@@ -367,24 +438,28 @@ v0.3 should not force users to use the WebUI for operations that already have st
 
 The CLI and WebUI should converge on the same underlying state and semantics.
 
-## 3.9 v0.3 Non-goals
+## 3.11 v0.3 Non-goals
 
 Do not add:
 
 - Electron solely to host the WebUI;
 - a custom chat UI;
+- ChatGPT conversation/session management;
 - source-code browsing/editing UI;
 - diff viewer as a primary product surface;
 - review history database;
+- CR/Plan completion analytics;
 - task management UI;
 - `.agent/tasks` workflow UI;
 - coding-harness control;
 - remote browser-accessible administration;
 - cloud-hosted WorkspaceLens control plane;
-- automatic Project mapping;
-- agent orchestration.
+- automatic ChatGPT Project mapping;
+- a separate tunnel/server per workspace by default;
+- agent orchestration;
+- prompt-library/version-management features.
 
-## 3.10 v0.3 Engineering Risk Areas
+## 3.12 v0.3 Engineering Risk Areas
 
 The main expected engineering effort is concentrated here:
 
@@ -394,35 +469,40 @@ The main expected engineering effort is concentrated here:
 4. modeling connection state honestly without claiming provider-side state that cannot be observed;
 5. adding login/autostart behavior without coupling Core to OS-specific process management;
 6. packaging the Node runtime, UI assets, tunnel integration, and startup behavior into a repeatable installation experience;
-7. preserving an easy uninstall/disable path and avoiding hidden persistent processes.
+7. preserving an easy uninstall/disable path and avoiding hidden persistent processes;
+8. maintaining request-scoped workspace isolation under concurrent multi-workspace access.
 
 These are v0.3's central productization problems. Visual design sophistication is secondary.
 
-## 3.11 v0.3 Acceptance Criteria
+## 3.13 v0.3 Acceptance Criteria
 
 v0.3 is complete when:
 
 1. A user can open a local WebUI without manually editing WorkspaceLens configuration files.
-2. A user can add, inspect, disable/enable, and remove authorized workspaces from that UI.
-3. CLI and WebUI operate on the same configuration and authorization semantics.
-4. A user can understand the current local service and ChatGPT tunnel integration state from the UI.
-5. WorkspaceLens can manage the expected tunnel-client lifecycle without reimplementing the tunnel protocol.
-6. Normal daily usage no longer requires manually starting multiple commands in the expected supported setup.
-7. Autostart can be explicitly enabled and disabled where the release supports it.
-8. The local WebUI is loopback-only by default and protected against arbitrary cross-origin state-changing requests.
-9. WorkspaceLens Core remains independent of WebUI, HTTP transport, ChatGPT, tunnel-client lifecycle, and OS startup mechanisms.
+2. A user can add, inspect, disable/enable, and remove multiple authorized workspaces from that UI.
+3. One normal WorkspaceLens service/provider connection can expose multiple authorized workspaces without per-workspace tunnel setup.
+4. CLI and WebUI operate on the same configuration and authorization semantics.
+5. A user can understand current local service and tunnel integration state from the UI.
+6. WorkspaceLens can manage the expected tunnel-client lifecycle without reimplementing the tunnel protocol.
+7. Provider-owned setup steps are clearly identified and guided without unsupported automation.
+8. Normal daily usage no longer requires manually starting multiple commands in the expected supported setup.
+9. Autostart can be explicitly enabled and disabled where the release supports it.
+10. The WebUI can expose stable workspace identity and optional Project Instructions / Review / Plan prompt helpers without introducing workflow state.
+11. Concurrent requests for different workspaces remain isolated and no global active-workspace state affects tool behavior.
+12. The local WebUI is loopback-only by default and protected against arbitrary cross-origin state-changing requests.
+13. WorkspaceLens Core remains independent of WebUI, HTTP transport, ChatGPT, tunnel-client lifecycle, and OS startup mechanisms.
 
 ---
 
-# 4. v0.4 — ChatGPT Project / Local Workspace Interaction Model
+# 4. v0.4 — Workspace Targeting and MCP Observability
 
 ## Goal
 
-Reduce repeated workspace-selection friction for high-frequency projects without creating a technical dependency between WorkspaceLens Core and ChatGPT Projects.
+Reduce workspace-selection friction for high-frequency projects and make the local context connection observable without turning WorkspaceLens into a ChatGPT conversation manager or workflow analytics product.
 
-## Product Model
+## 4.1 Workspace Targeting Model
 
-The recommended convention is:
+The recommended convention for high-frequency projects is:
 
 ```text
 Local Workspace A
@@ -441,8 +521,6 @@ A WorkspaceLens workspace is a local authorization and context-access unit.
 
 They are not the same object and MUST NOT become the same object in Core.
 
-## Required v0.4 behavior
-
 ### Project Instructions convention
 
 Document a recommended Project Instructions pattern that identifies the preferred WorkspaceLens workspace for that Project.
@@ -455,6 +533,8 @@ If the workspace is unavailable or ambiguous, do not guess; inspect the availabl
 ```
 
 The exact wording may evolve.
+
+The v0.3 `Copy Project Instructions` helper is a convenience for establishing this convention. It does not establish a technical ChatGPT Project binding.
 
 ### Natural name matching
 
@@ -470,13 +550,86 @@ If multiple authorized workspaces exist and no unique workspace can be determine
 
 Ordinary chats remain supported. The user can explicitly name the workspace in the request.
 
-### Optional WebUI assistance
+## 4.2 MCP Activity / Access Log
 
-The v0.3 WebUI may later expose small convenience actions such as copying a recommended Project Instructions snippet for a selected workspace.
+v0.4 may add a bounded local activity log for factual observability of WorkspaceLens MCP and connection behavior.
 
-Such actions are UX helpers only. They do not establish a technical Project binding.
+Useful event facts include, where available and safe:
 
-## Security boundary
+- timestamp;
+- request/event identifier;
+- workspace identity;
+- MCP tool name;
+- success/failure;
+- bounded error category;
+- request duration;
+- response size or truncation indicator;
+- tunnel disconnect/reconnect or lifecycle event.
+
+Example conceptual view:
+
+```text
+17:32:11  daily-signals  git_compare  OK     382 ms
+17:32:13  daily-signals  read_file    OK      42 ms
+17:33:04  tunnel                       disconnected
+17:33:08  tunnel                       reconnected
+```
+
+The activity log exists to answer operational questions such as:
+
+- Did the reasoning client actually call WorkspaceLens?
+- Which workspace was accessed?
+- Which tool failed?
+- Was the tunnel disconnected?
+- Was a request unusually slow or truncated?
+
+### Observability boundary
+
+Activity data MUST remain factual.
+
+WorkspaceLens MUST NOT infer from tool-call patterns that:
+
+- a code review started or completed;
+- a plan started or completed;
+- a review passed/failed;
+- a task is complete;
+- a particular ChatGPT conversation owns the activity.
+
+Metrics such as `CRs this week`, `plans completed`, or `review success rate` are out of scope unless a future explicit workflow protocol provides those facts. v0.4 does not introduce such a protocol.
+
+Retention should be bounded and local. Secrets and sensitive content must not be copied into activity records.
+
+## 4.3 Workspace Context Summary
+
+The WebUI MAY expose lightweight factual context for each workspace, for example:
+
+- logical workspace name;
+- local path where appropriate;
+- enabled/disabled state;
+- Git repository validity;
+- current branch;
+- current HEAD identifier;
+- clean/dirty working-tree summary;
+- last MCP access time.
+
+This is context/status visibility, not a source-code browser or diff viewer.
+
+## 4.4 Security / Exposure Visibility
+
+If it can be implemented using existing policy facts without creating a second security model, the WebUI MAY show a concise effective-access summary such as:
+
+```text
+Repository access   READ ONLY
+Git context         Enabled
+Sensitive paths     Protected
+Credentials/keys    Protected
+```
+
+A simple `why unavailable?` explanation for policy-blocked paths is useful if it reuses the existing AccessPolicy result and does not expose protected content.
+
+A general policy editor is not required by v0.4.
+
+## 4.5 Security Boundary
 
 Project organization MUST NOT be presented as workspace authorization isolation.
 
@@ -484,20 +637,25 @@ A recommendation that Project A normally uses Workspace A does not imply that th
 
 If stricter isolation becomes a demonstrated need, it should be designed as a WorkspaceLens connection-authorization scope independent of ChatGPT Project IDs.
 
-## v0.4 Non-goals
+## 4.6 v0.4 Non-goals
 
 Do not add:
 
 - ChatGPT Project IDs to WorkspaceLens Core;
 - ChatGPT chat IDs to WorkspaceLens Core;
-- Project lifecycle synchronization;
+- ChatGPT conversation lifecycle synchronization;
+- a local chat/session manager;
 - fuzzy Project/workspace matching;
 - global `recent workspace` state that silently changes behavior across chats;
 - Project-based access-control claims that WorkspaceLens cannot enforce;
 - a second tunnel per Project by default;
-- mandatory one-workspace-per-Project enforcement.
+- mandatory one-workspace-per-Project enforcement;
+- CR/Plan completion analytics;
+- review outcome analytics;
+- source browser or diff viewer;
+- workflow/task state derived from MCP logs.
 
-## v0.4 Acceptance Criteria
+## 4.7 Acceptance Criteria
 
 v0.4 is complete when:
 
@@ -506,46 +664,95 @@ v0.4 is complete when:
 3. Ordinary chats can continue to select workspaces explicitly.
 4. Ambiguous workspace selection results in explicit discovery/selection rather than fuzzy guessing.
 5. Product documentation clearly distinguishes Project organization from WorkspaceLens authorization scope.
+6. Users can inspect bounded factual MCP/connection activity sufficient to diagnose which workspace/tool was accessed and whether it succeeded.
+7. Activity logging does not infer review, planning, task, or conversation semantics.
+8. The WebUI can show useful workspace context/status without becoming a code browser.
 
 ---
 
-# 5. v0.5 — Reviewer Behavior and development-flow Composition
+# 5. v0.5 — Reasoning Workflow Composition
 
 ## Goal
 
-Make reasoning chats more consistently effective as reviewers while keeping reasoning behavior and engineering process outside WorkspaceLens Core.
+Document and, where repeated user friction justifies it, package lightweight reasoning helpers that compose WorkspaceLens context with existing project processes without turning WorkspaceLens into an orchestrator.
 
-## Responsibility Model
+v0.5 is intentionally conditional and mostly outside WorkspaceLens Core.
+
+## 5.1 Workload Boundary
+
+WorkspaceLens is designed for reasoning-dense inspection loops:
+
+```text
+Inspect repository facts
+        |
+        v
+Reason
+        |
+        v
+Inspect additional evidence
+        |
+        v
+Conclude / produce a plan or review
+```
+
+Typical suitable workloads include:
+
+- code review;
+- requirement audit;
+- architecture review;
+- implementation planning;
+- regression/risk analysis;
+- repository understanding.
+
+WorkspaceLens is not designed to replace execution-dense coding harness loops:
+
+```text
+Inspect
+  |
+  v
+Change
+  |
+  v
+Execute / build / test
+  |
+  v
+Observe
+  |
+  `----> repeat
+```
+
+Implementation, debugging, test execution, iterative refactoring, and build/fix loops belong to Codex, Claude Code, Zcode, IDE agents, or other local coding harnesses.
+
+This distinction is about workload shape, not a claim that reasoning tasks require no loop. Review and planning use inspection/reasoning loops; coding uses write/execute/observe loops.
+
+## 5.2 Responsibility Model
 
 The intended long-term composition is:
 
 ```text
-WorkspaceLens    = Context
-
-development-flow = Process
-
-Reviewer Skill   = Reasoning behavior
+WorkspaceLens                     = Context
+Project Instructions / Skill      = Reasoning behavior
+Repository process / human        = Process
+Coding harness                    = Execution
 ```
 
-These layers should compose through repository state and prompts/skills rather than through an orchestration protocol.
+`development-flow` is one reference process integration, not a required dependency of WorkspaceLens.
 
-## WorkspaceLens responsibility
+These layers should compose through repository state and prompts/skills rather than through a WorkspaceLens orchestration protocol.
 
-WorkspaceLens continues to provide only safe read-only access to repository facts, including source files, search, workspace metadata, Git state, and review-relevant Git history/ranges.
+## 5.3 WorkspaceLens Responsibility
 
-WorkspaceLens does not know which development-flow phase owns the current task.
+WorkspaceLens continues to provide safe read-only access to repository facts, including source files, search, workspace metadata, Git state, and review-relevant Git history/ranges.
 
-## development-flow responsibility
+WorkspaceLens does not know whether the current activity is a CR, plan, architecture review, requirement audit, or another reasoning task.
 
-`development-flow` owns persistent engineering protocol and task state, including `.agent/tasks/<task-id>` contracts, gates, state, and evidence.
+It does not own task phases, completion state, review outcome, or builder execution state.
 
-Those task files are ordinary repository state and can be inspected through WorkspaceLens like any other authorized non-sensitive repository files.
+## 5.4 Optional Reasoning Helpers
 
-No dedicated development-flow API is required merely to make the two systems work together.
+The v0.3 Review Prompt and Plan Prompt remain optional bootstrap conveniences.
 
-## Reviewer Skill responsibility
-
-A future Reviewer Skill may define reusable reasoning behavior for activities such as:
+If repeated real-world friction demonstrates that reusable reasoning behavior deserves packaging, a future independent skill MAY define behavior for activities such as:
 
 - code review;
 - architecture review;
@@ -555,29 +762,44 @@ A future Reviewer Skill may define reusable reasoning behavior for activities su
 - test-gap and false-green analysis;
 - handoff summarization.
 
-The Reviewer Skill should remain usable with other context sources such as GitHub, uploaded diffs, or another read-only repository connector. It should not require WorkspaceLens as a hard dependency.
+Such a skill:
 
-The Reviewer Skill should also avoid duplicating workflow state transitions or gate definitions already owned by `development-flow`.
+- should remain usable with other context sources such as GitHub, uploaded diffs, or another read-only repository connector;
+- should not require WorkspaceLens as a hard dependency;
+- should not duplicate project workflow state or gates;
+- should not become mandatory merely because WorkspaceLens reaches v0.5.
 
-## ChatGPT Project Instructions
+If Project Instructions, repository instructions, or an existing review/plan skill already solve the problem, WorkspaceLens should not create another competing source of truth.
+
+## 5.5 Reference Process Integration: development-flow
+
+When a repository uses `development-flow`, that system continues to own persistent engineering protocol and task state such as `.agent/tasks/<task-id>` contracts, gates, state, and evidence.
+
+Those task files are ordinary repository state and can be inspected through WorkspaceLens like any other authorized non-sensitive repository files.
+
+No dedicated `development-flow` API is required merely to make the systems work together.
+
+A reasoning helper may understand or summarize those files, but WorkspaceLens Core does not implement their state machine.
+
+## 5.6 Project Instructions
 
 Project Instructions may provide stable project-level preferences such as:
 
 - preferred WorkspaceLens workspace;
 - project-specific review emphasis;
-- stable project constraints that belong in the chat environment.
+- stable project constraints that belong in the reasoning environment.
 
-They should not become the durable store of task state when `development-flow` is being used.
+They should not become the durable store of task state when the repository already has a process/state mechanism.
 
-## Human handoff remains the boundary
+## 5.7 Human Handoff Remains the Boundary
 
-The final reviewer conclusion continues to be transferred to the Builder by the user.
+The final reviewer/planner conclusion continues to be transferred to the Builder by the user.
 
-WorkspaceLens v0.5 MUST NOT automatically forward reviewer output to Codex, Claude Code, Zcode, an IDE, or another coding harness.
+WorkspaceLens v0.5 MUST NOT automatically forward reasoning output to Codex, Claude Code, Zcode, an IDE, or another coding harness.
 
-A skill may produce a concise handoff block for the user to copy, but it must not execute or transmit the handoff automatically.
+A skill or prompt may produce a concise handoff block for the user to copy, but it must not execute or transmit the handoff automatically.
 
-## v0.5 Non-goals
+## 5.8 v0.5 Non-goals
 
 Do not add:
 
@@ -588,17 +810,22 @@ Do not add:
 - automatic review/implementation loops;
 - C2C orchestration;
 - WorkspaceLens-specific workflow state;
-- duplicated `development-flow` gates in the Reviewer Skill.
+- mandatory Reviewer/Planner Skill packaging;
+- duplicated project-process gates;
+- dynamic test/build execution through WorkspaceLens;
+- CR/Plan semantic session tracking inside WorkspaceLens.
 
-## v0.5 Acceptance Criteria
+## 5.9 Acceptance Criteria
 
 v0.5 is complete when:
 
-1. WorkspaceLens, development-flow, and Reviewer Skill have documented non-overlapping responsibilities.
-2. A reviewer can inspect relevant `.agent/tasks` state through normal WorkspaceLens read operations when that repository uses development-flow.
-3. Reviewer behavior is reusable independently of WorkspaceLens.
-4. development-flow remains the owner of workflow phase/gate semantics.
-5. Reviewer conclusions can be formatted for handoff while final transfer remains an explicit user action.
+1. The reasoning-dense inspection loop and execution-dense implementation loop are documented as distinct product workloads.
+2. WorkspaceLens, optional reasoning helpers, repository process, and coding harness have documented non-overlapping responsibilities.
+3. WorkspaceLens remains unaware of CR/Plan/task semantic state.
+4. A repository process such as `development-flow` can be inspected through normal WorkspaceLens read operations without a dedicated integration protocol.
+5. Any packaged reasoning behavior remains reusable independently of WorkspaceLens and does not duplicate workflow state.
+6. Reviewer/planner conclusions can be formatted for handoff while final transfer remains an explicit user action.
+7. If no repeated user friction justifies a dedicated skill, v0.5 may remain primarily a composition/documentation release rather than adding product surface area.
 
 ---
 
@@ -606,29 +833,65 @@ v0.5 is complete when:
 
 The following requirements apply to every version in this roadmap.
 
-## 6.1 No agent orchestration
+## 6.1 No Agent Orchestration
 
 Do not introduce an event bus, reviewer/builder protocol, shared execution state, automatic forwarding, or autonomous review/implementation loop.
 
-## 6.2 No write expansion in WorkspaceLens Core
+## 6.2 No Write Expansion in WorkspaceLens Core
 
-WorkspaceLens remains a read-only context product. Product-control operations such as adding/removing authorized workspace entries or starting/stopping the local integration runtime belong to the local control/configuration layer and do not grant the MCP reviewer write access to repository contents.
+WorkspaceLens remains a read-only context product. Product-control operations such as adding/removing authorized workspace entries or starting/stopping the local integration runtime belong to the local control/configuration layer and do not grant the MCP reasoning client write access to repository contents.
 
-## 6.3 Provider independence remains architectural
+## 6.3 One Service, Many Workspaces
+
+A normal WorkspaceLens deployment may expose multiple explicitly authorized workspaces through one service/provider connection.
+
+Do not create per-workspace MCP servers, tunnels, or provider apps by default merely to support multiple projects.
+
+## 6.4 No Conversation Ownership
+
+WorkspaceLens does not own or model ChatGPT chats, conversation IDs, Project IDs, review sessions, or plan sessions.
+
+Provider-side conversation organization remains provider-side state.
+
+## 6.5 Explicit Workspace Identity
+
+Content-bearing operations must resolve against an explicit authorized workspace identity.
+
+Do not add hidden global `current workspace`, `recent workspace`, or similar state that can silently redirect requests from different chats.
+
+## 6.6 Concurrent Workspace Isolation
+
+Concurrent requests targeting different workspaces must remain isolated in filesystem root, Git working directory, access-policy evaluation, output handling, and errors.
+
+Concurrency must not weaken workspace authorization boundaries.
+
+## 6.7 Observability Must Be Factual
+
+WorkspaceLens may record bounded MCP tool and connection activity.
+
+It must not infer CR completion, plan completion, review outcome, task state, or conversation ownership from tool-call patterns.
+
+## 6.8 Provider Independence Remains Architectural
 
 ChatGPT is the first and most developed reasoning surface, but WorkspaceLens Core contracts must not require ChatGPT-specific Project, chat, tunnel, or account concepts.
 
-## 6.4 Harness independence remains architectural
+Provider-specific onboarding and lifecycle adapters stay outside Core.
+
+## 6.9 Harness Independence Remains Architectural
 
 Codex, Claude Code, Zcode, IDEs, and humans remain interchangeable builders as long as they modify the same local workspace.
 
-## 6.5 Prefer explicit behavior over hidden state
+WorkspaceLens must not require a particular execution harness.
 
-Do not add hidden global session state merely to guess the active workspace or task. Explicit workspace identity, repository-persisted task facts, and visible connection state are preferred.
+## 6.10 Prefer Explicit Behavior over Hidden State
 
-## 6.6 Add complexity only after observed friction
+Explicit workspace identity, repository-persisted facts, visible connection state, and explicit user handoff are preferred over implicit session memory or cross-client synchronization.
 
-Potential features such as per-connection workspace scopes, Windows-native startup integration, richer diagnostics, or additional reasoning skills should be promoted into committed requirements only when the current simpler model creates a demonstrated recurring problem.
+## 6.11 Add Complexity Only after Observed Friction
+
+Potential features such as per-connection workspace scopes, richer security-policy UI, Windows-native startup integration, additional reasoning skills, or deeper process integrations should be promoted into committed requirements only when the current simpler model creates a demonstrated recurring problem.
+
+A small control-plane product is acceptable. Feature count is not a success criterion.
 
 ---
 
@@ -637,8 +900,12 @@ Potential features such as per-connection workspace scopes, Windows-native start
 | Version | Primary Outcome | Engineering Weight |
 | --- | --- | --- |
 | v0.2 | Complete local Git review context and make setup reproducible | Small / focused |
-| v0.3 | Local Control Service + browser WebUI + lifecycle productization | **Largest** |
-| v0.4 | Stable ChatGPT Project / workspace convention without Core coupling | Small / UX-policy focused |
-| v0.5 | Compose Context + Process + Reviewer reasoning without orchestration | Medium, mostly outside Core |
+| v0.3 | Local Context Control Plane: WebUI, onboarding, multi-workspace management, connection lifecycle, identity | **Largest** |
+| v0.4 | Stable workspace targeting plus factual MCP/connection observability | Small / medium, UX + diagnostics focused |
+| v0.5 | Compose Context + Reasoning + Process + Execution without orchestration | Small / conditional, mostly outside Core |
 
-The immediate implementation focus after v0.1 is v0.2. The primary design and engineering risk to prepare for is v0.3.
+The immediate implementation focus after v0.2 is v0.3.
+
+The central v0.3 engineering risks are local-control security, provider lifecycle integration, reliable daily availability, and concurrent multi-workspace isolation.
+
+The primary roadmap constraint after v0.3 is scope discipline: WorkspaceLens should become a dependable local context control plane for reasoning clients, not a general coding-agent runtime or workflow platform.
