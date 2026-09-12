@@ -1,10 +1,10 @@
 # WorkspaceLens Product Experience
 
-Status: Product contract for MVP (`v0.1`).
+Status: Durable product contract, updated with accepted v0.3 productization decisions.
 
-This document defines the intended user experience, interaction model, and product boundaries of WorkspaceLens.
+This document defines what WorkspaceLens should feel like to use. Detailed v0.3 behavior lives in the version-specific product, interaction, UI, architecture, security, bootstrap, and implementation documents.
 
-It complements the technical contracts in `security-model.md` and `mcp-tools-spec.md`. Where those documents define what WorkspaceLens is allowed to do, this document defines what the product should feel like to use.
+---
 
 ## 1. Product Thesis
 
@@ -14,80 +14,65 @@ WorkspaceLens solves one narrow problem:
 
 WorkspaceLens is not a coding agent, task orchestrator, message bus, or synchronization layer between AI products.
 
-The durable product model is provider- and harness-agnostic:
-
-- A builder changes code in the local workspace. The builder may be Codex, Claude Code, an IDE, another coding harness, or the developer directly.
-- A high-reasoning chat reviews, analyzes, and discusses the real local state. ChatGPT is the first target surface, not the permanent product boundary.
-- WorkspaceLens gives the reviewer safe read-only visibility into that state.
-- The human decides what conclusions should be handed back to the builder.
-
-A useful mental model is:
+The durable product model is:
 
 ```text
 Coding harness / IDE   = Builder
 Reasoning chat         = Reviewer / Thinker
-WorkspaceLens          = Eyes
+WorkspaceLens          = Eyes / local context control plane
 Local workspace        = Shared source of truth
 User                   = Decision boundary
 ```
 
-The central product principle is:
+The central principle remains:
 
 > **WorkspaceLens automates context transfer, not decision transfer.**
 
-## 2. Target End-State Experience
+---
 
-The desired daily experience is not an MCP workflow. It is a normal chat workflow.
+## 2. Target Daily Experience
 
-A developer should be able to open a supported reasoning chat and say:
+The desired daily experience is a normal reasoning conversation, not an MCP workflow.
 
-```text
-Review the current uncommitted changes in workspace-lens.
-Focus on architecture risks and potential bugs.
-```
+A developer should be able to open a supported reasoning chat and ask for review, planning, architecture, requirement analysis, or repository understanding against an authorized local workspace.
 
-The reviewer should then be able to obtain the required context through WorkspaceLens:
+The reasoning client may internally use WorkspaceLens tools such as:
 
 ```text
 workspace_list
-    -> git_status
-    -> git_diff
-    -> search_workspace
-    -> read_file
-    -> discussion with user
+-> git_status / git_diff / git_compare
+-> search_workspace
+-> read_file
+-> discussion with user
 ```
 
 The user should not need to:
 
-- upload a ZIP
-- push code to GitHub
-- copy a diff into the chat
-- explain the repository structure manually
-- initialize a review session
-- synchronize coding-harness state
-- create task IDs
-- understand MCP transport details
-- configure a domain or reverse proxy
+- upload a ZIP;
+- push local changes to GitHub first;
+- paste diffs/files into chat;
+- explain repository structure manually;
+- initialize a review session;
+- synchronize coding-harness state;
+- create task IDs;
+- understand MCP transport details;
+- manage tunnel PIDs/processes;
+- own/configure a public domain.
 
-The product succeeds when local workspace access feels like a capability already present in the chat.
+The product succeeds when local workspace access feels like a safe capability already available to the reasoning chat.
 
-## 3. A Chat Window Is Required
+---
 
-WorkspaceLens must preserve an interactive chat as the primary review surface.
+## 3. Reasoning Chat Remains the Primary Work Surface
 
-The intended product is not:
+WorkspaceLens does not build a custom reasoning/chat UI.
 
-```text
-workspace-lens review
--> static report
-```
-
-The important workflow is interactive reasoning:
+The valuable loop is:
 
 ```text
-User <-> Reviewer Chat
+User <-> reasoning chat
           |
-          | read-only context
+          | read-only factual context
           v
      WorkspaceLens
           |
@@ -95,106 +80,120 @@ User <-> Reviewer Chat
    Local Workspace
 ```
 
-The user must be able to:
+The user can:
 
-- ask follow-up questions
-- challenge a recommendation
-- compare alternatives
-- ask the model to inspect additional files
-- refine constraints
-- reject part of a review
-- converge on a final implementation recommendation
+- ask follow-up questions;
+- challenge recommendations;
+- inspect more evidence;
+- compare alternatives;
+- refine constraints;
+- reject part of a review;
+- converge on a final plan/recommendation.
 
-The value is not only automated code inspection. It is the combination of **real workspace context + high-quality interactive reasoning**.
+WorkspaceLens supplies factual local context; the reasoning product supplies the conversation.
 
-## 4. First-Time Setup vs Daily Usage
+---
 
-WorkspaceLens should distinguish between one-time platform setup and normal daily use.
+## 4. First-time Setup vs Daily Usage
 
-### 4.1 First-Time Setup
+### 4.1 v0.2/current verified setup
 
-The target experience is approximately:
+`getting-started.md` documents the real v0.2 CLI/tunnel setup and remains the source of truth for the current implemented release line.
 
-```bash
-install WorkspaceLens
-workspace-lens add ~/code/my-project
-workspace-lens connect chatgpt
-```
+### 4.2 v0.3 target setup
 
-The exact command names may change, but the conceptual steps should remain:
+The accepted v0.3 productization principle is:
 
-1. Install WorkspaceLens.
-2. Explicitly authorize one or more local workspace roots.
-3. Connect WorkspaceLens to the chosen reasoning client once.
-4. Complete any provider account or connector authorization that WorkspaceLens cannot perform on the user's behalf.
+> **One install, one bootstrap, zero daily CLI.**
 
-WorkspaceLens should hide implementation concepts such as:
-
-- MCP transport selection
-- tunnel process details
-- tunnel IDs where possible
-- runtime lifecycle
-- localhost ports
-- connector health checks
-
-If a provider requires the user to complete a browser-based authorization step, WorkspaceLens should guide the user to that step rather than inventing an additional configuration system.
-
-### 4.2 Daily Usage
-
-The product goal is **zero initialization for normal use**.
-
-After initial setup, the user should not need to run a chain of setup commands before every review.
-
-A long-running local service or equivalent lifecycle mechanism may keep WorkspaceLens available between sessions.
-
-Normal usage should look like:
+The first required distribution may use:
 
 ```text
-Open reasoning chat
--> ask about an authorized workspace
--> discuss the result
+npm install -g workspace-lens
+workspace-lens start
 ```
 
-No per-review session initialization is part of the product model.
+Then:
+
+```text
+browser opens local WorkspaceLens WebUI
+-> guided setup
+-> authorize workspaces
+-> configure provider connection
+-> verify real MCP access
+-> enable Start at login
+```
+
+After successful setup/autostart, ordinary daily use should require no Terminal interaction.
+
+The browser is a control surface, not the long-lived runtime. Closing the browser must not stop WorkspaceLens or the configured provider connection.
+
+Native installers may improve onboarding later without changing this product model.
+
+---
 
 ## 5. Workspace Model
 
-WorkspaceLens should be modeled as one local service managing multiple explicitly authorized workspaces, not one MCP server per project.
+WorkspaceLens is one local product/service managing multiple explicitly authorized workspaces.
 
 Example:
 
 ```text
 WorkspaceLens
-├── ~/code/workspace-lens
-├── ~/code/appshot
-└── ~/code/j-store
+├── workspace-lens
+├── daily-signals
+├── pocket-railway
+└── J-Store
 ```
 
-Authorization remains explicit and workspace-scoped.
+Adding another project normally means only authorizing another workspace.
 
-Internally, each workspace may have a stable `workspace_id`, but users should normally interact with human-readable workspace names.
+It should not require:
 
-The user should not need to know or manage opaque workspace IDs.
+- another WorkspaceLens install;
+- another MCP server by default;
+- another tunnel by default;
+- another ChatGPT app by default.
 
-The preferred UX is:
+Internally, each workspace has a stable `workspace_id`. Product surfaces may also show a human-readable name/root/status.
 
-```bash
-workspace-lens add ~/code/workspace-lens
+v0.3 default provider authorization scope is:
+
+> all enabled registered workspaces are discoverable through the one normal WorkspaceLens provider connection.
+
+A disabled workspace is unavailable.
+
+Per-connection workspace subsets are deferred until a real security/multi-user use case requires them.
+
+---
+
+## 6. Workspace Selection and Chat Identity
+
+WorkspaceLens does not know which coding harness project is “current,” and does not own ChatGPT chat or Project identity.
+
+There is no hidden/global `current workspace` or `recent workspace` state.
+
+The preferred high-frequency convention is:
+
+```text
+ChatGPT Project: daily-signals
+  |
+  | Project Instructions
+  v
+Use WorkspaceLens workspace "daily-signals"
 ```
 
-not:
+In an ordinary chat, the user or reasoning client names/selects the explicit workspace.
 
-```bash
-workspace-lens register --id workspace-lens-a31f --root ...
-```
+If multiple workspaces exist and the target is ambiguous, WorkspaceLens/reasoning client should enumerate/ask rather than guess.
 
-The MCP contract may use `workspace_id` for safety and precision while the product layer hides that implementation detail.
+No builder/IDE state synchronization is introduced merely to remove this ambiguity.
 
-## 6. Reviewer and Builder Are Intentionally Separate
+---
 
-WorkspaceLens does not try to merge a coding harness and reasoning chat into one agent system.
+## 7. Reviewer and Builder Are Intentionally Separate
 
-The expected workflow is:
+Expected workflow:
 
 ```text
 Builder
@@ -208,7 +207,7 @@ Local Workspace
 WorkspaceLens
    ^
    |
-Reviewer Chat
+Reasoning Chat
    |
    | discussion
    v
@@ -219,217 +218,159 @@ User
 Builder
 ```
 
-This separation is intentional.
+Builder owns execution:
 
-The builder owns execution:
+- editing;
+- commands;
+- tests;
+- implementation;
+- debugging loops.
 
-- editing files
-- running commands
-- tests
-- implementation
+Reasoning chat owns reasoning:
 
-The reviewer chat owns reasoning:
+- architecture;
+- code review;
+- planning;
+- risk analysis;
+- requirement audit;
+- repository understanding.
 
-- architecture analysis
-- code review
-- risk analysis
-- debugging discussion
-- design alternatives
+WorkspaceLens owns context access and local connection control only.
 
-WorkspaceLens owns only local read-only context.
+---
 
-## 7. Handoff Back to the Builder Is Manual by Design
+## 8. Handoff Back to the Builder Is Manual by Design
 
-The final reviewer conclusion should not automatically trigger code changes.
+The final reasoning conclusion must not automatically trigger code changes.
 
-For the MVP, the user manually transfers the final recommendation back to the coding harness, typically by copy/paste.
+The user manually transfers the final recommendation/instruction to the coding harness.
 
-This is not considered a missing transport feature. It is a deliberate human approval boundary.
+WorkspaceLens MUST NOT introduce by default:
 
-Automatic reviewer-to-builder transfer would immediately introduce questions such as:
+- automatic reviewer -> builder message forwarding;
+- coding-harness task creation;
+- review/execution state synchronization;
+- execution acknowledgements;
+- automatic review/implementation loops.
 
-- Which message is the final instruction?
-- Are intermediate ideas executable?
-- Which recommendations has the user rejected?
-- Does the builder need acknowledgements or task state?
-- Should execution results be sent back to the reviewer?
-- Is another review cycle automatic?
+Optional formatting/copy helpers may reduce friction while keeping the user as the explicit approval boundary.
 
-Those questions lead toward task synchronization, state machines, and agent orchestration, which are outside the WorkspaceLens product.
+---
 
-Therefore the MVP MUST NOT introduce:
+## 9. Read-only Capability Is a Product Feature
 
-- automatic reviewer -> builder message forwarding
-- coding-harness task creation
-- review/execution state synchronization
-- execution acknowledgements
-- automatic review loops
+WorkspaceLens's small capability surface is intentional.
 
-A later lightweight feature MAY help format a final review into a concise handoff block, but this should remain user-controlled and should not execute or transmit anything automatically.
+The reasoning MCP does not gain side effects merely to remove minor manual actions.
 
-## 8. Clipboard and Local Write Actions Are Not MVP Features
+No:
 
-A tool such as:
+- file writes;
+- arbitrary command execution;
+- arbitrary Git passthrough;
+- local note/task creation through MCP;
+- coding-harness control.
 
-```text
-copy_to_clipboard(text)
-```
+The v0.3 WebUI may mutate **WorkspaceLens-owned administration state** (workspace authorization, settings, connection lifecycle) but still cannot edit authorized workspace contents.
 
-would save very little interaction while weakening the read-only security story.
+---
 
-WorkspaceLens should not gain local side effects merely to eliminate one copy operation.
+## 10. Provider Connection Is an Integration Detail
 
-For the MVP:
-
-- no clipboard writes
-- no file writes
-- no local note creation
-- no handoff file generation
-- no command execution
-
-The value is safe context access, not automation of every adjacent action.
-
-## 9. ChatGPT Connection and Secure Tunnel
-
-### 9.1 Durable Product Decision
-
-The user should not need to own or configure a domain or subdomain in order to use WorkspaceLens with ChatGPT.
-
-Tunnel infrastructure is an integration detail, not a core user concept.
-
-WorkspaceLens Core should remain independent of any specific tunnel implementation.
+Users should not need to understand tunnel implementation details.
 
 Conceptually:
 
 ```text
-Chat Provider
-   |
-Connection / Tunnel Integration
-   |
-WorkspaceLens Core
-   |
+Reasoning Provider
+       |
+Provider Integration / Tunnel
+       |
+WorkspaceLens
+       |
 Authorized Workspaces
 ```
 
-The core MCP tools, workspace model, and security policy must not depend on a public hostname.
+For ChatGPT, WorkspaceLens uses the official OpenAI tunnel client rather than reimplementing Secure MCP Tunnel.
 
-### 9.2 Current Platform Assumption
-
-As of the current ChatGPT MCP integration model, ChatGPT does not directly connect to a developer-machine `localhost` MCP server. OpenAI documents Secure MCP Tunnel as the supported way to connect local or private MCP servers without exposing them directly to the public internet.
-
-Reference:
-
-- https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta
-
-This is a platform assumption, not a permanent WorkspaceLens architectural requirement. If OpenAI later provides a simpler local transport, WorkspaceLens should adopt it without changing the Core contracts.
-
-Other MCP-capable clients may use different connection mechanisms. Those differences belong in integration modules rather than Core.
-
-## 10. Tunnel Complexity Should Be Hidden
-
-The desired ChatGPT setup command is conceptually:
-
-```bash
-workspace-lens connect chatgpt
-```
-
-not a manual multi-step infrastructure tutorial.
-
-The integration layer may internally:
-
-- verify WorkspaceLens is running
-- verify the official tunnel runtime is available
-- start or supervise the tunnel runtime
-- check connectivity and health
-- guide the user through required provider authorization
-
-WorkspaceLens should prefer the official OpenAI Secure MCP Tunnel implementation rather than reimplementing the tunnel protocol.
-
-The Core remains independent:
+In v0.3, WorkspaceLens should expose product actions such as:
 
 ```text
-WorkspaceLens Core
-- Workspace Manager
-- AccessPolicy
-- MCP Tools
-- Filesystem Adapter
-- Git Adapter
-
-Provider Integrations
-- connection lifecycle
-- connector setup guidance
-- health checks
+Connection: Healthy
+[Restart connection]
 ```
 
-## 11. Interaction Surface
+not require normal users to reason about:
 
-WorkspaceLens itself should not build a browser or chat UI for the MVP.
+```text
+PIDs
+pgrep
+child processes
+runtime aliases
+health ports
+```
 
-The preferred experience is to reuse an existing reasoning-chat surface.
+Other MCP-capable reasoning clients may use different transports without changing Core tool semantics.
 
-Current ChatGPT desktop products provide a built-in browser in Work and Codex on macOS and Windows. This creates a potentially useful interaction surface for keeping development and web discussion close together.
+---
 
-Reference:
+## 11. v0.3 WebUI Role
 
-- https://help.openai.com/en/articles/20001277-using-the-built-in-browser-in-the-chatgpt-desktop-app
+WorkspaceLens v0.3 adds a local browser WebUI, but it is **not** a new daily development workbench.
 
-However, WorkspaceLens MUST NOT depend on a specific embedded-browser workflow.
+Its purpose is:
 
-The supported mental model should remain valid whether the reviewer chat is opened in:
+- setup;
+- workspace authorization management;
+- connection status/recovery;
+- diagnostics;
+- settings/autostart;
+- optional workspace-targeting/reasoning prompt helpers.
 
-- a normal web browser
-- ChatGPT desktop
-- a built-in browser surface
-- another MCP-capable AI client in the future
+When WorkspaceLens is healthy, the ideal user often does not open the WebUI at all.
 
-An embedded ChatGPT page inside a coding environment may be a useful workflow if it works reliably, but it is an integration convenience rather than a Core feature.
+The WebUI is not:
 
-## 12. Product Non-Goals
+- a custom chat UI;
+- source-code browser/editor;
+- terminal;
+- diff workbench;
+- task board;
+- build/test runner;
+- CR/Plan analytics dashboard;
+- agent manager.
 
-WorkspaceLens MVP explicitly does not include:
+---
 
-- a custom chat UI
-- a custom browser
-- browser automation
-- coding-harness integration protocol
-- coding-harness state synchronization
-- reviewer/builder shared task state
-- automatic message forwarding
-- automatic implementation
-- agent planning/execution loops
-- write-capable MCP tools
-- arbitrary shell access
-- workspace modification
-- cloud repository synchronization
-- mandatory GitHub usage
-- mandatory domains or subdomains
+## 12. Observability Is Factual, Not Semantic
 
-These exclusions are product decisions, not temporary missing features.
+WorkspaceLens may know factual operational events such as:
 
-They should only be reconsidered if real user evidence shows that a specific omission materially blocks the core review workflow.
+```text
+workspace_id
+tool called
+success/error
+duration
+result size/truncation
+connection lifecycle
+last request timestamp
+```
 
-## 13. Product Acceptance Criteria
+It cannot reliably infer from those facts:
 
-The MVP product experience is successful when all of the following are true:
+- CR completed;
+- plan completed;
+- review result;
+- task status;
+- ChatGPT conversation identity.
 
-1. A user can explicitly authorize a local repository without exposing unrelated local files.
-2. The user does not need to push local changes to GitHub before review.
-3. The user does not need to manually paste project files or diffs into the reviewer chat.
-4. A supported reviewer can inspect project structure, files, search results, Git status, and local diffs through the defined read-only tools.
-5. The user can conduct a normal multi-turn review conversation.
-6. The user does not need to initialize a review state machine or synchronize builder context.
-7. After one-time setup, ordinary review sessions require no WorkspaceLens initialization steps.
-8. ChatGPT connection does not require the user to own a custom domain.
-9. WorkspaceLens cannot modify the workspace or execute arbitrary commands.
-10. Returning the final recommendation to the coding harness remains an explicit user action.
-11. Replacing Codex with another builder does not require changes to WorkspaceLens Core.
-12. Supporting another MCP-capable reasoning client does not require changes to WorkspaceLens Core tool contracts.
+v0.4 may add bounded MCP Activity / Access Log, but it remains observability rather than work analytics.
 
-## 14. Shared State Is the Workspace
+---
 
-The product does not need direct builder-to-reviewer state synchronization for ordinary review.
+## 13. Shared State Is the Workspace
 
-The workspace itself provides the shared state:
+The workspace itself provides builder/reviewer shared state:
 
 ```text
 Builder changes code
@@ -439,57 +380,57 @@ Workspace state
         |
         | WorkspaceLens reads current state
         v
-Reviewer Chat
+Reasoning Chat
 ```
 
-A builder can be replaced without an adapter as long as it changes the same local files and Git repository.
+A builder can be replaced without a WorkspaceLens adapter as long as it changes the same local files/Git repository.
 
-This is an important simplicity property. WorkspaceLens should not add harness adapters merely to know how the code was changed.
+This simplicity is a core product property.
 
-## 15. Open Product Decisions
+---
 
-Two product questions remain intentionally unresolved. They must not be solved by introducing hidden state synchronization before the MVP workflow is tested.
+## 14. Product Non-Goals
 
-### 15.1 Active workspace ambiguity
+WorkspaceLens does not aim to become:
 
-If multiple workspaces are authorized and the user says:
+- autonomous coding agent;
+- coding-harness orchestrator;
+- chat/session manager;
+- browser automation system;
+- remote code storage service;
+- workflow state machine;
+- task synchronization service;
+- write-capable repository bridge;
+- arbitrary shell gateway;
+- mandatory GitHub integration;
+- mandatory public-domain service.
 
-```text
-Review my current project.
-```
+These exclusions should only be reconsidered if concrete user evidence shows that one omission materially blocks the core context/reasoning workflow.
 
-WorkspaceLens cannot inherently know which repository a separate coding harness currently has open.
+---
 
-For the MVP, acceptable behavior includes:
+## 15. Product Acceptance Principles
 
-- the user names the workspace in the conversation, or
-- the reviewer calls `workspace_list` and asks/selects when necessary.
+The durable product experience is successful when:
 
-The product MUST NOT add Codex/Claude Code/IDE state synchronization solely to remove this small ambiguity.
+1. Local workspaces are explicitly authorized without exposing unrelated files.
+2. Reasoning clients can inspect current local/unpushed state without GitHub push or file uploads.
+3. Multi-turn reasoning remains in the user's preferred reasoning/chat product.
+4. One WorkspaceLens installation can manage multiple workspaces.
+5. Workspace targeting is explicit and never silently redirected by global recent/current state.
+6. WorkspaceLens cannot modify workspace contents or execute arbitrary commands through MCP.
+7. Returning conclusions to the coding harness remains user-controlled.
+8. Provider/harness replacement does not require Core redesign.
+9. v0.3 onboarding hides process/tunnel infrastructure from ordinary users.
+10. After successful v0.3 setup with autostart, normal daily use requires no Terminal interaction.
+11. Closing the browser does not stop WorkspaceLens.
+12. Operational status is factual and does not invent ChatGPT/CR/Plan semantics.
 
-If user evidence later shows that active-workspace selection is a meaningful recurring friction, it may be solved as an explicit product feature.
-
-### 15.2 Connection authorization scope
-
-One local daemon may manage several authorized workspaces, for example personal, open-source, and company projects.
-
-It is not yet decided whether a single remote connector should automatically see all registered workspaces or only an explicitly selected subset.
-
-This must be treated as a security/product decision rather than a daemon implementation detail.
-
-The architecture should therefore preserve the distinction between:
-
-```text
-Daemon lifecycle
-!=
-Connection authorization scope
-```
-
-A later stricter scoping model must be possible without changing WorkspaceLens Core tool semantics.
+---
 
 ## 16. Decision Summary
 
-The MVP product should optimize for this workflow:
+The product optimizes for:
 
 ```text
 Builder changes code
@@ -499,27 +440,19 @@ Real local workspace
         |
         | WorkspaceLens: safe read-only context
         v
-High-reasoning reviewer chat
+High-reasoning chat
         |
         | interactive discussion
         v
 Human decision
         |
-        | manual handoff
+        | explicit handoff
         v
 Builder continues implementation
 ```
 
-The simplicity is intentional.
+WorkspaceLens should be a small, trustworthy, largely invisible bridge between local code and reasoning models.
 
-WorkspaceLens should be a small, trustworthy bridge between local code and reasoning models, not the beginning of another agent orchestration framework.
+The mature experience is:
 
-The durable boundaries are:
-
-> **Core is chat-provider agnostic.**
->
-> **Core is coding-harness agnostic.**
->
-> **Workspace is the integration boundary and shared source of truth.**
->
-> **WorkspaceLens automates context transfer, not decision transfer.**
+> install once -> configure multiple workspaces -> keep it available -> mostly forget that it is there.
