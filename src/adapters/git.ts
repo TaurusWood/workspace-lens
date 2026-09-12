@@ -319,8 +319,13 @@ async function resolveEmptyTreeSha(toplevel: string): Promise<string> {
 // Commit metadata parsing (v0.2-requirements.md §3.1/§3.2: metadata only)
 // ---------------------------------------------------------------------------
 
-/** %H %P %an %cI %s — \x01-separated fields inside a NUL-separated record. */
-const COMMIT_FORMAT = "%H%x01%P%x01%an%x01%cI%x01%s";
+/**
+ * Five NUL-terminated fields per record. Git identity/message text may contain
+ * ordinary control characters such as `\x01`, so only NUL is safe framing for
+ * parsed pretty-format output.
+ */
+const COMMIT_FORMAT = "%H%x00%P%x00%an%x00%cI%x00%s";
+const COMMIT_FIELDS_PER_RECORD = 5;
 
 interface CommitMetadata {
   commit: string;
@@ -328,6 +333,8 @@ interface CommitMetadata {
   subject: string;
   author_name: string;
   committed_at: string;
+  /** Present only when a field above was server-truncated to a hard bound. */
+  metadata_truncated?: true;
 }
 
 /** Strict ISO-8601 UTC (`2026-09-05T12:34:56Z`), locale-independent. */
@@ -339,9 +346,8 @@ function normalizeCommitTimestamp(value: string): string {
   return parsed.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function parseCommitRecord(record: string): CommitMetadata {
-  const fields = record.split("\x01");
-  if (fields.length < 5 || !COMMIT_SHA.test(fields[0]!)) {
+function parseCommitFields(fields: readonly string[]): CommitMetadata {
+  if (fields.length !== COMMIT_FIELDS_PER_RECORD || !COMMIT_SHA.test(fields[0]!)) {
     throw new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be parsed.");
   }
   return {
@@ -349,35 +355,208 @@ function parseCommitRecord(record: string): CommitMetadata {
     parents: fields[1] === "" ? [] : fields[1]!.split(" "),
     author_name: fields[2]!,
     committed_at: normalizeCommitTimestamp(fields[3]!),
-    // A subject may itself contain \x01 bytes; keep them in the subject.
-    subject: fields.slice(4).join("\x01"),
+    subject: fields[4]!,
   };
 }
 
+/** Hard per-field byte bounds for commit metadata (`v0.2-security-contract.md` §7). */
+interface CommitMetadataBounds {
+  subjectBytes: number;
+  authorBytes: number;
+}
+
+interface StreamedMetadataField {
+  chunks: Buffer[];
+  storedBytes: number;
+  exceededLogicalLimit: boolean;
+}
+
+function metadataFieldLimit(fieldIndex: number, bounds: CommitMetadataBounds): number {
+  switch (fieldIndex) {
+    case 0:
+      return 64; // resolved SHA-1/SHA-256 object id
+    case 1:
+      return GIT_MAX_BUFFER_BYTES; // parent list; the public contract requires every parent
+    case 2:
+      return bounds.authorBytes;
+    case 3:
+      return 128; // ISO-8601 timestamp
+    case 4:
+      return bounds.subjectBytes;
+    default:
+      throw new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be parsed.");
+  }
+}
+
+function createStreamedMetadataField(): StreamedMetadataField {
+  return { chunks: [], storedBytes: 0, exceededLogicalLimit: false };
+}
+
+/**
+ * Retain only a bounded prefix of a metadata field while the child process is
+ * still streaming. Four look-ahead bytes let UTF-8 truncation find a complete
+ * code-point boundary without buffering the rest of an oversized field.
+ */
+function appendMetadataFieldBytes(
+  field: StreamedMetadataField,
+  bytes: Buffer,
+  logicalLimit: number,
+): void {
+  if (bytes.length === 0) return;
+  if (field.storedBytes + bytes.length > logicalLimit) {
+    field.exceededLogicalLimit = true;
+  }
+  const storageLimit = logicalLimit + 4;
+  const remaining = storageLimit - field.storedBytes;
+  if (remaining <= 0) return;
+  const kept = bytes.subarray(0, Math.min(remaining, bytes.length));
+  field.chunks.push(kept);
+  field.storedBytes += kept.length;
+}
+
+function decodeMetadataField(
+  field: StreamedMetadataField,
+  logicalLimit: number,
+): { text: string; truncated: boolean } {
+  const buffer = Buffer.concat(field.chunks, field.storedBytes);
+  if (!field.exceededLogicalLimit) {
+    return { text: buffer.toString("utf8"), truncated: false };
+  }
+  let end = Math.min(logicalLimit, buffer.length);
+  while (end > 0 && end < buffer.length && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+  return { text: buffer.subarray(0, end).toString("utf8"), truncated: true };
+}
+
+/**
+ * Stream commit metadata with per-field retention limits. This deliberately
+ * does not use `execFile`/`maxBuffer`: bounds must apply while untrusted Git
+ * metadata is being collected, not only after the entire output is resident.
+ */
 async function readCommitLog(
   toplevel: string,
   startSha: string,
   maxCount: number,
+  bounds: CommitMetadataBounds,
 ): Promise<CommitMetadata[]> {
-  const result = await runGit(toplevel, [
-    "log",
-    "-z",
-    "--no-color",
-    "--no-show-signature",
-    `--format=${COMMIT_FORMAT}`,
-    "-n",
-    String(maxCount),
-    startSha,
-  ]);
-  if (result.code !== 0) {
-    throw new AppError("GIT_OPERATION_FAILED", "Commit history could not be read.");
-  }
-  const commits: CommitMetadata[] = [];
-  for (const record of result.stdout.split("\x00")) {
-    if (record === "") continue;
-    commits.push(parseCommitRecord(record));
-  }
-  return commits;
+  return new Promise((resolve, reject) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(
+        GIT_EXECUTABLE,
+        [
+          ...GIT_CONFIG_ARGS,
+          "log",
+          "-z",
+          "--no-color",
+          "--no-show-signature",
+          `--format=${COMMIT_FORMAT}`,
+          "-n",
+          String(maxCount),
+          startSha,
+        ],
+        {
+          cwd: toplevel,
+          shell: false,
+          windowsHide: true,
+          env: { ...process.env, ...GIT_ENV_OVERRIDES },
+        },
+      );
+    } catch (error) {
+      reject(new GitSpawnError("Git executable is not available.", { cause: error }));
+      return;
+    }
+
+    if (child.stdout === null || child.stderr === null) {
+      reject(new GitSpawnError("Failed to open child process stdio pipes."));
+      return;
+    }
+
+    const commits: CommitMetadata[] = [];
+    let fields: string[] = [];
+    let metadataTruncated = false;
+    let currentField = createStreamedMetadataField();
+    let parseError: AppError | undefined;
+    let timedOut = false;
+    let settled = false;
+
+    const finishReject = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+
+    child.on("error", (error) => {
+      finishReject(new GitSpawnError("Git executable is not available.", { cause: error }));
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, GIT_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (parseError !== undefined) return;
+      let offset = 0;
+      while (offset < chunk.length) {
+        const delimiter = chunk.indexOf(0, offset);
+        const end = delimiter === -1 ? chunk.length : delimiter;
+        const fieldIndex = fields.length;
+        try {
+          const logicalLimit = metadataFieldLimit(fieldIndex, bounds);
+          appendMetadataFieldBytes(currentField, chunk.subarray(offset, end), logicalLimit);
+          if (delimiter === -1) break;
+
+          const decoded = decodeMetadataField(currentField, logicalLimit);
+          if (decoded.truncated) {
+            if (fieldIndex === 2 || fieldIndex === 4) metadataTruncated = true;
+            else {
+              throw new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be parsed.");
+            }
+          }
+          fields.push(decoded.text);
+          currentField = createStreamedMetadataField();
+
+          if (fields.length === COMMIT_FIELDS_PER_RECORD) {
+            const record = parseCommitFields(fields);
+            commits.push(metadataTruncated ? { ...record, metadata_truncated: true } : record);
+            fields = [];
+            metadataTruncated = false;
+          }
+          offset = delimiter + 1;
+        } catch (error) {
+          parseError =
+            error instanceof AppError
+              ? error
+              : new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be parsed.");
+          child.kill("SIGKILL");
+          return;
+        }
+      }
+    });
+
+    // Drain stderr without retaining repository-controlled output. Public
+    // failures are normalized below and never expose raw Git diagnostics.
+    child.stderr.resume();
+
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (settled) return;
+      if (parseError !== undefined) {
+        finishReject(parseError);
+        return;
+      }
+      if (timedOut || signal !== null || code !== 0) {
+        finishReject(new AppError("GIT_OPERATION_FAILED", "Commit history could not be read."));
+        return;
+      }
+      if (fields.length !== 0 || currentField.storedBytes !== 0) {
+        finishReject(new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be parsed."));
+        return;
+      }
+      settled = true;
+      resolve(commits);
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +617,8 @@ export interface GitHistoryCommit {
   subject: string;
   author_name: string;
   committed_at: string;
+  /** Present only when `subject`/`author_name` were cut to the hard metadata bounds. */
+  metadata_truncated?: true;
 }
 
 export interface GitHistoryResult {
@@ -445,6 +626,11 @@ export interface GitHistoryResult {
   start: string;
   commits: GitHistoryCommit[];
   truncated: boolean;
+  /**
+   * True when metadata was server-bounded: any returned commit had fields
+   * cut, or the combined metadata payload ceiling stopped the list early.
+   */
+  metadata_truncated: boolean;
 }
 
 export interface GitCommitResult {
@@ -453,6 +639,8 @@ export interface GitCommitResult {
   subject: string;
   author_name: string;
   committed_at: string;
+  /** True when `subject`/`author_name` were cut to the hard metadata bounds. */
+  metadata_truncated: boolean;
   /** First parent SHA, or null for a root commit (empty-tree comparison). */
   comparison_base: string | null;
   files_changed: number;
@@ -894,25 +1082,32 @@ export class GitAdapter {
 
         let text = "";
         let sectionTruncated = false;
-        if (allowedPathspecs.length > 0 && budget > 0) {
-          const diffArgs = [
-            "diff",
-            "-M",
-            "-C",
-            "--find-copies-harder",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-          ];
-          if (sectionScope === "staged") diffArgs.push("--cached");
-          diffArgs.push("--", ...allowedPathspecs);
-          const diffRun = await runGitBounded(context.toplevel, diffArgs, budget);
-          if (diffRun.code !== 0) {
-            throw new AppError("GIT_OPERATION_FAILED", "Git diff could not be read.");
+        if (allowedPathspecs.length > 0) {
+          if (budget <= 0) {
+            // The global byte budget was already exhausted by an earlier
+            // section, so no body can be returned here at all. This must
+            // not read as "no changes": the section reports truncation.
+            sectionTruncated = true;
+          } else {
+            const diffArgs = [
+              "diff",
+              "-M",
+              "-C",
+              "--find-copies-harder",
+              "--no-color",
+              "--no-ext-diff",
+              "--no-textconv",
+            ];
+            if (sectionScope === "staged") diffArgs.push("--cached");
+            diffArgs.push("--", ...allowedPathspecs);
+            const diffRun = await runGitBounded(context.toplevel, diffArgs, budget);
+            if (diffRun.code !== 0) {
+              throw new AppError("GIT_OPERATION_FAILED", "Git diff could not be read.");
+            }
+            assertReliableRenameDetection(diffRun.stderr);
+            text = diffRun.stdout;
+            sectionTruncated = diffRun.truncated;
           }
-          assertReliableRenameDetection(diffRun.stderr);
-          text = diffRun.stdout;
-          sectionTruncated = diffRun.truncated;
         }
 
         // Defense in depth: drop any file section whose header paths are
@@ -1112,11 +1307,34 @@ export class GitAdapter {
         Math.min(Math.trunc(maxCommits), this.limits.maxGitHistoryCommits),
       );
       // One extra record powers the truncation flag without a second query.
-      const fetched = await readCommitLog(context.toplevel, start, bounded + 1);
+      const fetched = await readCommitLog(context.toplevel, start, bounded + 1, {
+        subjectBytes: this.limits.maxHistorySubjectBytes,
+        authorBytes: this.limits.maxHistoryAuthorBytes,
+      });
+      const commits: GitHistoryCommit[] = [];
+      let metadataTruncated = false;
+      let budgetStopped = false;
+      let usedBytes = 0;
+      for (const record of fetched.slice(0, bounded)) {
+        const entryBytes = Buffer.byteLength(JSON.stringify(record), "utf8");
+        if (usedBytes + entryBytes > this.limits.maxHistoryMetadataBytes) {
+          // The payload ceiling cut the list short: more commits exist than
+          // are returned, so the count truncation flag applies as well.
+          metadataTruncated = true;
+          budgetStopped = true;
+          break;
+        }
+        usedBytes += entryBytes;
+        if (record.metadata_truncated === true) {
+          metadataTruncated = true;
+        }
+        commits.push(record);
+      }
       return {
         start,
-        commits: fetched.slice(0, bounded),
-        truncated: fetched.length > bounded,
+        commits,
+        truncated: fetched.length > bounded || budgetStopped,
+        metadata_truncated: metadataTruncated,
       };
     });
   }
@@ -1131,17 +1349,31 @@ export class GitAdapter {
       const validated = validateRevisionInput(revision);
       const context = await this.resolveContext(root);
       const sha = await resolveCommitSha(context.toplevel, validated);
-      const [metadata] = await readCommitLog(context.toplevel, sha, 1);
+      const [metadata] = await readCommitLog(context.toplevel, sha, 1, {
+        subjectBytes: this.limits.maxHistorySubjectBytes,
+        authorBytes: this.limits.maxHistoryAuthorBytes,
+      });
       if (metadata === undefined || metadata.commit !== sha) {
         throw new AppError("GIT_OPERATION_FAILED", "Commit metadata could not be read.");
       }
+      const metadataTruncated = metadata.metadata_truncated === true;
       if (metadata.parents.length === 0) {
         const emptyTree = await resolveEmptyTreeSha(context.toplevel);
         const diffResult = await this.committedDiff(context, emptyTree, sha);
-        return { ...metadata, comparison_base: null, ...diffResult };
+        return {
+          ...metadata,
+          metadata_truncated: metadataTruncated,
+          comparison_base: null,
+          ...diffResult,
+        };
       }
       const diffResult = await this.committedDiff(context, metadata.parents[0]!, sha);
-      return { ...metadata, comparison_base: metadata.parents[0]!, ...diffResult };
+      return {
+        ...metadata,
+        metadata_truncated: metadataTruncated,
+        comparison_base: metadata.parents[0]!,
+        ...diffResult,
+      };
     });
   }
 

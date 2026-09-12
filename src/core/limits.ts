@@ -25,6 +25,12 @@ export interface ServerLimits {
   defaultGitHistoryCommits: number;
   /** Hard server ceiling for the `git_history` commit count. */
   maxGitHistoryCommits: number;
+  /** Hard byte ceiling for a single commit `subject` in metadata results. */
+  maxHistorySubjectBytes: number;
+  /** Hard byte ceiling for a single commit `author_name` in metadata results. */
+  maxHistoryAuthorBytes: number;
+  /** Hard byte ceiling for the combined commit metadata payload of one `git_history` result. */
+  maxHistoryMetadataBytes: number;
   /** Bounded length of a search preview line. */
   maxSearchPreviewChars: number;
   /** Maximum search query length. */
@@ -45,6 +51,9 @@ export const DEFAULT_LIMITS: ServerLimits = {
   maxDiffPayloadBytes: 256 * 1024, // 256 KiB
   defaultGitHistoryCommits: 20,
   maxGitHistoryCommits: 100,
+  maxHistorySubjectBytes: 4 * 1024, // 4 KiB
+  maxHistoryAuthorBytes: 1024, // 1 KiB
+  maxHistoryMetadataBytes: 128 * 1024, // 128 KiB
   maxSearchPreviewChars: 200,
   maxQueryLength: 500,
   maxSearchFileScan: 20000,

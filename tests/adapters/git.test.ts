@@ -293,6 +293,34 @@ describe("GitAdapter", () => {
       expect(Buffer.byteLength(result.sections[0]!.diff, "utf8")).toBeLessThanOrEqual(DEFAULT_LIMITS.maxDiffPayloadBytes);
     });
 
+    it("marks later sections truncated when scope=all exhausts the shared global budget", async () => {
+      const budgetRoot = path.join(scratch, "budget-all");
+      initRepo(budgetRoot, { "a.txt": "a\n", "b.txt": "b\n" });
+      // The staged change alone exceeds the whole global payload budget...
+      write(budgetRoot, "a.txt", `${"S".repeat(4000)}\n`);
+      git(budgetRoot, "add", "a.txt");
+      // ...so the real unstaged change cannot be returned at all and must
+      // not read as an empty diff.
+      write(budgetRoot, "b.txt", `${"U".repeat(4000)}\n`);
+
+      const tiny = new GitAdapter({
+        limits: { ...DEFAULT_LIMITS, maxDiffPayloadBytes: 500 },
+        policy: new AccessPolicy(),
+      });
+      const result = await tiny.diff(budgetRoot, "all");
+      expect(result.truncated).toBe(true);
+
+      const [staged, unstaged] = result.sections;
+      expect(staged!.scope).toBe("staged");
+      expect(staged!.truncated).toBe(true);
+      expect(staged!.diff).not.toBe("");
+
+      expect(unstaged!.scope).toBe("unstaged");
+      expect(unstaged!.files_changed).toBe(1);
+      expect(unstaged!.diff).toBe("");
+      expect(unstaged!.truncated).toBe(true);
+    });
+
     it("reports an empty diff for a clean repository", async () => {
       const cleanRoot = path.join(scratch, "clean");
       initRepo(cleanRoot, { "a.txt": "a\n" });

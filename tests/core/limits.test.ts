@@ -11,6 +11,9 @@ describe("DEFAULT_LIMITS", () => {
     expect(DEFAULT_LIMITS.defaultSearchResults).toBe(50);
     expect(DEFAULT_LIMITS.maxSearchResults).toBe(100);
     expect(DEFAULT_LIMITS.maxDiffPayloadBytes).toBe(256 * 1024); // 256 KiB
+    expect(DEFAULT_LIMITS.maxHistorySubjectBytes).toBe(4 * 1024); // 4 KiB
+    expect(DEFAULT_LIMITS.maxHistoryAuthorBytes).toBe(1024); // 1 KiB
+    expect(DEFAULT_LIMITS.maxHistoryMetadataBytes).toBe(128 * 1024); // 128 KiB
     expect(DEFAULT_LIMITS.maxQueryLength).toBe(500);
   });
 

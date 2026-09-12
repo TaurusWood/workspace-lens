@@ -215,6 +215,113 @@ describe("GitAdapter historical primitives (v0.2)", () => {
       expect(result.truncated).toBe(true);
     });
 
+    it("bounds oversized subject and author metadata with explicit flags", async () => {
+      const root = path.join(scratch, "repo");
+      initRepo(root, { "a.txt": "a\n" });
+      git(root, "commit", "-q", "--allow-empty", "-m", `s${"x".repeat(100 * 1024)}`);
+      git(
+        root,
+        "commit",
+        "-q",
+        "--allow-empty",
+        `--author=${"A".repeat(8 * 1024)} <author@example.com>`,
+        "-m",
+        "normal subject",
+      );
+
+      const result = await adapter.history(root, "HEAD", 5);
+      const [top, second, init] = result.commits;
+      expect(result.truncated).toBe(false);
+
+      expect(top!.subject).toBe("normal subject");
+      expect(Buffer.byteLength(top!.author_name, "utf8")).toBeLessThanOrEqual(
+        DEFAULT_LIMITS.maxHistoryAuthorBytes,
+      );
+      expect(top!.metadata_truncated).toBe(true);
+
+      expect(Buffer.byteLength(second!.subject, "utf8")).toBeLessThanOrEqual(
+        DEFAULT_LIMITS.maxHistorySubjectBytes,
+      );
+      expect(second!.metadata_truncated).toBe(true);
+
+      expect(init!.metadata_truncated).toBeUndefined();
+      expect(result.metadata_truncated).toBe(true);
+    });
+
+    it("parses control characters in author names and subjects without breaking field framing", async () => {
+      const root = path.join(scratch, "repo-control-metadata");
+      initRepo(root, { "a.txt": "a\n" });
+      git(
+        root,
+        "commit",
+        "-q",
+        "--allow-empty",
+        `--author=A\x01B <author@example.com>`,
+        "-m",
+        "subject\x01tail",
+      );
+
+      const history = await adapter.history(root, "HEAD", 1);
+      expect(history.commits[0]).toMatchObject({
+        author_name: "A\x01B",
+        subject: "subject\x01tail",
+      });
+      expect(history.metadata_truncated).toBe(false);
+
+      const inspected = await adapter.commit(root, "HEAD");
+      expect(inspected.author_name).toBe("A\x01B");
+      expect(inspected.subject).toBe("subject\x01tail");
+      expect(inspected.metadata_truncated).toBe(false);
+    });
+
+    it("cuts multi-byte subjects on code-point boundaries", async () => {
+      const root = path.join(scratch, "repo-utf8");
+      initRepo(root, { "a.txt": "a\n" });
+      git(root, "commit", "-q", "--allow-empty", "-m", `a${"é".repeat(8 * 1024)}`);
+
+      const result = await adapter.history(root, "HEAD", 1);
+      const subject = result.commits[0]!.subject;
+      expect(Buffer.byteLength(subject, "utf8")).toBeLessThanOrEqual(
+        DEFAULT_LIMITS.maxHistorySubjectBytes,
+      );
+      expect(subject.startsWith("a")).toBe(true);
+      expect(subject).not.toContain("\uFFFD");
+      expect(result.commits[0]!.metadata_truncated).toBe(true);
+    });
+
+    it("streams subjects larger than the former execFile maxBuffer into a bounded result", async () => {
+      const root = path.join(scratch, "repo-huge-metadata");
+      initRepo(root, { "a.txt": "a\n" });
+      const messagePath = path.join(scratch, "huge-commit-message.txt");
+      fs.writeFileSync(messagePath, Buffer.alloc(34 * 1024 * 1024, "x"));
+      git(root, "commit", "-q", "--allow-empty", "-F", messagePath);
+
+      const result = await adapter.history(root, "HEAD", 1);
+      expect(result.commits).toHaveLength(1);
+      expect(Buffer.byteLength(result.commits[0]!.subject, "utf8")).toBeLessThanOrEqual(
+        DEFAULT_LIMITS.maxHistorySubjectBytes,
+      );
+      expect(result.commits[0]!.metadata_truncated).toBe(true);
+      expect(result.metadata_truncated).toBe(true);
+    }, 30_000);
+
+    it("stops within the combined metadata payload budget and flags both truncations", async () => {
+      const root = path.join(scratch, "repo");
+      buildDivergedRepo(root);
+      const tiny = new GitAdapter({
+        limits: { ...DEFAULT_LIMITS, maxHistoryMetadataBytes: 400 },
+        policy: new AccessPolicy(),
+      });
+
+      const result = await tiny.history(root, "main", 5);
+      expect(result.commits.map((commit) => commit.subject)).toEqual([
+        "E: docs",
+        "D: change base",
+      ]);
+      expect(result.truncated).toBe(true);
+      expect(result.metadata_truncated).toBe(true);
+    });
+
     it("handles detached HEAD", async () => {
       const root = path.join(scratch, "repo");
       buildDivergedRepo(root);
@@ -374,6 +481,22 @@ describe("GitAdapter historical primitives (v0.2)", () => {
       const compareRes = await tiny.compare(root, base, head, "direct");
       expect(compareRes.truncated).toBe(true);
       expect(compareRes.files_changed).toBe(8);
+    });
+
+    it("bounds oversized commit metadata without affecting the diff", async () => {
+      const root = path.join(scratch, "bigmeta");
+      initRepo(root, { "a.txt": "one\n" });
+      write(root, "a.txt", "two\n");
+      const sha = commitAll(root, `s${"x".repeat(100 * 1024)}`);
+
+      const result = await adapter.commit(root, sha);
+      expect(Buffer.byteLength(result.subject, "utf8")).toBeLessThanOrEqual(
+        DEFAULT_LIMITS.maxHistorySubjectBytes,
+      );
+      expect(result.metadata_truncated).toBe(true);
+      expect(result.truncated).toBe(false);
+      expect(result.diff).toContain("a.txt");
+      expect(result.diff).toContain("+two");
     });
 
     it("gracefully truncates diffs exceeding the 32 MiB maxBuffer ceiling without error", async () => {
