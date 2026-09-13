@@ -20,7 +20,9 @@
     "serve": "node dist/cli/index.js serve"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "hono": "^4.13.7",
     "zod": "^4.1.13"
   },
   "devDependencies": {

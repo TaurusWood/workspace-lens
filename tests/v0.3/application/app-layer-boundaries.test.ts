@@ -42,12 +42,16 @@ describe("APP — application layer framework boundaries", () => {
     expect(violations).toEqual([]);
   });
 
-  it("production dependencies declare no Hono or React packages", () => {
+  it("production dependencies declare no UI-framework packages", () => {
+    // Hono is the accepted local HTTP adapter for the Control Runtime
+    // (RFC §15, Slice 3) and lives only under src/control; the framework
+    // boundary that matters here is React/UI ownership, which arrives with
+    // the WebUI slices and belongs to the ui/ workspace, not runtime deps.
     const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
       dependencies?: Record<string, string>;
     };
     const deps = Object.keys(pkg.dependencies ?? {});
-    const violations = deps.filter((dep) => /^(hono|react|react-dom)(@.*)?$/i.test(dep) || dep.startsWith("@hono/"));
+    const violations = deps.filter((dep) => /^(react|react-dom|react-router|next)(@.*)?$/i.test(dep));
     expect(violations).toEqual([]);
   });
 });
