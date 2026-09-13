@@ -23,28 +23,41 @@ function toRegistered(ws: WorkspaceConfig): RegisteredWorkspace {
 }
 
 export class WorkspaceRegistry {
-  constructor(private readonly config: WorkspaceLensConfig) {}
+  private readonly config: WorkspaceLensConfig;
+
+  constructor(config: WorkspaceLensConfig) {
+    this.config = config;
+  }
+
+  /**
+   * The config snapshot all registry methods observe. The static registry
+   * serves one fixed snapshot; the live registry overrides this to resolve
+   * the current validated config for every authorization decision.
+   */
+  protected get snapshot(): WorkspaceLensConfig {
+    return this.config;
+  }
 
   /**
    * Local-only option: when enabled, workspace_info may return the
    * canonical absolute root path (`mcp-tools-spec.md` §7).
    */
   get exposeAbsolutePaths(): boolean {
-    return this.config.expose_absolute_paths;
+    return this.snapshot.expose_absolute_paths;
   }
 
   /** All registered workspaces, including disabled ones. */
   listAll(): RegisteredWorkspace[] {
-    return this.config.workspaces.map(toRegistered);
+    return this.snapshot.workspaces.map(toRegistered);
   }
 
   /** Workspaces visible to MCP callers: explicitly authorized and enabled. */
   listEnabled(): RegisteredWorkspace[] {
-    return this.config.workspaces.filter((ws) => ws.enabled).map(toRegistered);
+    return this.snapshot.workspaces.filter((ws) => ws.enabled).map(toRegistered);
   }
 
   findById(workspaceId: string): RegisteredWorkspace | undefined {
-    const ws = this.config.workspaces.find((entry) => entry.workspace_id === workspaceId);
+    const ws = this.snapshot.workspaces.find((entry) => entry.workspace_id === workspaceId);
     return ws ? toRegistered(ws) : undefined;
   }
 

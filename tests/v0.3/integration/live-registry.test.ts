@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ConfigStore } from "../../../src/config/config-store.js";
+import { LiveWorkspaceRegistry } from "../../../src/core/live-workspace-registry.js";
+import { createToolContext, createWorkspaceLensServer } from "../../../src/mcp/server.js";
 import { makeTempRoot } from "../../helpers/fixtures.js";
 import { importExpected } from "../helpers/expected-module.js";
 import { callTool, cleanupWorkspace, makeConfig, makePlainWorkspace } from "../helpers/mcp.js";
@@ -112,6 +116,66 @@ describe("LIVE — workspace changes visible without runtime restart", () => {
     } finally {
       await handle?.close();
       cleanupWorkspace(workspaceA);
+    }
+  });
+
+  it("keeps concurrent A/B requests isolated on the live registry path", async () => {
+    const { WorkspaceAdminService } = (await importExpected("workspaceAdminService")) as any;
+    const workspaceA = makePlainWorkspace("liveisoa");
+    const workspaceB = makePlainWorkspace("liveisob");
+    const configDir = makeTempRoot("wl-v03-liveiso-config-");
+    const configPath = path.join(configDir, "config.json");
+    let client: Client | undefined;
+    let server: Awaited<ReturnType<typeof createWorkspaceLensServer>> | undefined;
+    try {
+      // Seed the on-disk config with A only; the registry resolves the
+      // current config for every authorization decision.
+      fs.writeFileSync(configPath, `${JSON.stringify(makeConfig([
+        { id: "liveiso-a", name: "liveisoa", root: workspaceA.root, enabled: true },
+      ]), null, 2)}\n`);
+
+      const store = new ConfigStore(configPath);
+      const registry = new LiveWorkspaceRegistry(() => store.load());
+      server = createWorkspaceLensServer(createToolContext({ registry }));
+      client = new Client({ name: "v0.3-live-iso-client", version: "0.0.0" });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+      // B becomes visible through the live path (added via the shared service).
+      const admin = new WorkspaceAdminService({ configStore: store });
+      await admin.add({ root: workspaceB.root, id: "liveiso-b" });
+
+      // Concurrent content requests against A and B must not cross.
+      const [readA, readB, listB] = await Promise.all([
+        callTool(client, "read_file", { workspace_id: "liveiso-a", path: workspaceA.sentinelFile }),
+        callTool(client, "read_file", { workspace_id: "liveiso-b", path: workspaceB.sentinelFile }),
+        callTool(client, "list_files", { workspace_id: "liveiso-b" }),
+      ]);
+      expect(readA.isError).toBeFalsy();
+      expect(JSON.stringify(readA)).toContain(workspaceA.sentinelContent);
+      expect(JSON.stringify(readA)).not.toContain(workspaceB.sentinelContent);
+      expect(JSON.stringify(readB)).toContain(workspaceB.sentinelContent);
+      expect(JSON.stringify(readB)).not.toContain(workspaceA.sentinelContent);
+      expect(JSON.stringify(listB)).not.toContain(workspaceA.sentinelContent);
+
+      // Disabling A is immediately observable; the concurrent B request is
+      // unaffected and A never falls through to B or any other workspace.
+      await admin.disable("liveiso-a");
+      const [disabledA, stillB] = await Promise.all([
+        callTool(client, "read_file", { workspace_id: "liveiso-a", path: workspaceA.sentinelFile }),
+        callTool(client, "read_file", { workspace_id: "liveiso-b", path: workspaceB.sentinelFile }),
+      ]);
+      expect(disabledA.isError).toBe(true);
+      expect(JSON.stringify(disabledA)).toContain("WORKSPACE_DISABLED");
+      expect(JSON.stringify(disabledA)).not.toContain(workspaceB.sentinelContent);
+      expect(stillB.isError).toBeFalsy();
+      expect(JSON.stringify(stillB)).toContain(workspaceB.sentinelContent);
+    } finally {
+      await client?.close();
+      await server?.close().catch(() => undefined);
+      cleanupWorkspace(workspaceA);
+      cleanupWorkspace(workspaceB);
+      fs.rmSync(configDir, { recursive: true, force: true });
     }
   });
 });

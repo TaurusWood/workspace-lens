@@ -1,7 +1,8 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ConfigStore, describeError } from "../../config/config-store.js";
 import { ConfigError } from "../../config/config-schema.js";
-import { WorkspaceRegistry } from "../../core/workspace-registry.js";
+import { LiveWorkspaceRegistry } from "../../core/live-workspace-registry.js";
+import type { WorkspaceRegistry } from "../../core/workspace-registry.js";
 import { StderrLogger } from "../../core/logger.js";
 import { createToolContext, createWorkspaceLensServer } from "../../mcp/server.js";
 
@@ -15,8 +16,11 @@ export async function runServe(): Promise<number> {
 
   let registry: WorkspaceRegistry;
   try {
+    // Live authorization: every request resolves the current validated
+    // config, so administration changes apply without a restart. The
+    // construction-time load still fails fast on a malformed config.
     const store = new ConfigStore();
-    registry = new WorkspaceRegistry(store.load());
+    registry = new LiveWorkspaceRegistry(() => store.load());
   } catch (error) {
     if (error instanceof ConfigError) {
       // Fail safely: never run against a partially interpreted config.
