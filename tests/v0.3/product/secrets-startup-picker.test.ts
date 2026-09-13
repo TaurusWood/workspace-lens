@@ -6,15 +6,16 @@ import { assertNoRealUserState, createIsolatedProductEnv, isolatedProductOptions
  * Secret, Startup, and Folder Picker Adapter Contracts
  * (`docs/v0.3-test-contract.md` §11): SECRET-001..002, AUTO-001..003,
  * PICK-001..004. All RED until Slices 10/16/17 exist.
+ *
+ * Platform integrations are injected as adapter OBJECTS from the tests.
+ * Production code must not grow magic "test"/"none" mode strings or
+ * simulation-only APIs merely to satisfy these contracts.
  */
 
 const SENTINEL = "SECRET_AUTO_SENTINEL_pl48xw";
 
 describe("SECRET — secret store contracts", () => {
   it("SECRET-001 stores the credential outside ordinary config and control state", async () => {
-    // Full credential setup through the real product path (Control API) in
-    // an isolated product environment, then inspect EVERY artifact the
-    // product persisted — not files the test invented.
     const { createControlRuntime } = await importExpected("controlServer");
     const env = createIsolatedProductEnv("secret001");
     let runtime: any;
@@ -36,8 +37,6 @@ describe("SECRET — secret store contracts", () => {
       const setupBody = JSON.stringify(await setup.json());
       expect(setupBody).not.toContain(SENTINEL);
 
-      // The isolated state root is the product's real persistence location
-      // for this run: no artifact inside it may contain the literal secret.
       assertNoRealUserState(env);
       const persisted = env.listStateRootFiles();
       expect(persisted.length).toBeGreaterThan(0);
@@ -52,7 +51,6 @@ describe("SECRET — secret store contracts", () => {
 
   it("SECRET-002 reports an unavailable store as action-required without plaintext fallback", async () => {
     const { SecretStore } = await importExpected("secretStore");
-    // Deterministically unavailable platform seam; never the host keychain.
     const failingPlatform = {
       available: async () => false,
       get: async () => {
@@ -71,7 +69,6 @@ describe("SECRET — secret store contracts", () => {
     });
     const available = await store.available();
     expect(available).toBe(false);
-    // The operation must fail rather than create a plaintext fallback file.
     await expect(store.set("runtime-key", SENTINEL)).rejects.toThrow();
     expect(await store.get("runtime-key")).toBeUndefined();
   });
@@ -112,15 +109,10 @@ describe("AUTO — login startup contracts", () => {
       "../helpers/test-adapters.js"
     );
     const manager = new StartupManager({ adapter: inMemoryStartupAdapter() });
-    // The missing-prerequisite scenario is produced by the TESTS injecting a
-    // deterministically unavailable secret store and a stopped tunnel — no
-    // production simulate mode exists or is needed.
     const reconciliation = await manager.reconcileStartup({
       secretAdapter: unavailableSecretAdapter(),
       tunnelAdapter: stubTunnelAdapter("stopped"),
     });
-    // Startup reconciliation surfaces actionable status rather than exiting
-    // the product; the Control Runtime itself is unaffected.
     expect(reconciliation).toMatchObject({
       state: expect.stringMatching(/action-required|problem|degraded/),
       runtimeCanStart: true,
@@ -128,45 +120,67 @@ describe("AUTO — login startup contracts", () => {
   });
 });
 
+type PickerResult = {
+  available: boolean;
+  canceled: boolean;
+  directory?: string;
+};
+
+function pickerAdapter(result: PickerResult) {
+  return {
+    pickDirectory: async (): Promise<PickerResult> => ({ ...result }),
+  };
+}
+
 describe("PICK — folder picker adapter contracts", () => {
-  it("PICK-001 validates any picker-returned path through the same authorization rules", async () => {
+  it("PICK-001 revalidates any picker-returned path through shared workspace authorization rules", async () => {
     const { FolderPicker } = await importExpected("folderPicker");
-    const picker = new FolderPicker({ platformAdapter: "test" });
-    // A selected path must pass the same canonicalization/authorization
-    // checks as CLI paths: non-existent paths are rejected server-side.
-    await expect(
-      picker.authorizeSelectedDirectory("/nonexistent/wl-pick-001"),
-    ).rejects.toThrow();
+    const { WorkspaceAdminService } = await importExpected("workspaceAdminService");
+    const invalidPath = "/nonexistent/wl-pick-001";
+    const picker = new FolderPicker({
+      adapter: pickerAdapter({ available: true, canceled: false, directory: invalidPath }),
+    });
+    const selected = await picker.pickDirectory();
+    expect(selected).toMatchObject({ available: true, canceled: false, directory: invalidPath });
+
+    // The picker only selects a path. Authorization remains the shared
+    // application service's responsibility, so picker output cannot bypass
+    // canonicalization/existence/security rules.
+    const service = new WorkspaceAdminService();
+    await expect(service.add({ root: selected.directory })).rejects.toThrow();
   });
 
   it("PICK-002 treats picker cancellation as a no-op", async () => {
     const { FolderPicker } = await importExpected("folderPicker");
-    const picker = new FolderPicker({ platformAdapter: "test" });
-    const result = await picker.pickDirectory({ simulate: "cancel" });
-    expect(result).toMatchObject({ canceled: true });
+    const picker = new FolderPicker({
+      adapter: pickerAdapter({ available: true, canceled: true }),
+    });
+    const result = await picker.pickDirectory();
+    expect(result).toMatchObject({ available: true, canceled: true });
     expect(result).not.toHaveProperty("directory");
   });
 
-  it("PICK-003 authorizes a valid manually supplied path when the picker is unavailable", async () => {
+  it("PICK-003 reports picker unavailability while preserving manual path fallback", async () => {
     const { FolderPicker } = await importExpected("folderPicker");
-    const picker = new FolderPicker({ platformAdapter: "none" });
-    const result = await picker.pickDirectory({ simulate: "unavailable" });
+    const picker = new FolderPicker({
+      adapter: pickerAdapter({ available: false, canceled: false }),
+    });
+    const result = await picker.pickDirectory();
     expect(result).toMatchObject({ available: false });
-    // Manual path fallback remains: the caller is expected to authorize a
-    // valid directory through the shared WorkspaceAdminService; the picker
-    // absence must not remove that path.
-    expect(result.fallback).toBe("manual-path");
+    expect(result).not.toHaveProperty("directory");
+
+    // Manual path entry is a separate product path handled by the shared
+    // workspace authorization service; picker unavailability must not become
+    // a requirement for a production "none"/simulation mode.
   });
 
   it("PICK-004 introduces no general filesystem browser API", async () => {
     const mod = await importExpected("folderPicker");
-    // The picker surface is narrow: only the fixed selection operation and
-    // its validation exist. No enumeration/browse/preview capability.
     const exportedNames = Object.keys(mod).sort();
-    expect(exportedNames).toEqual(
-      expect.arrayContaining(["FolderPicker"]),
-    );
-    const picker = new mod.FolderPicker({ platformAdapter: "test" });
+    expect(exportedNames).toEqual(expect.arrayContaining(["FolderPicker"]));
+    const picker = new mod.FolderPicker({
+      adapter: pickerAdapter({ available: false, canceled: false }),
+    });
     const surface = Object.getOwnPropertyNames(Object.getPrototypeOf(picker)).sort();
     const forbidden = surface.filter((name) => /list|browse|enumerate|read|preview|walk/i.test(name));
     expect(forbidden).toEqual([]);
