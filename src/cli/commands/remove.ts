@@ -1,3 +1,4 @@
+import { WorkspaceAdminService } from "../../application/workspace-admin-service.js";
 import { ConfigStore, describeError } from "../../config/config-store.js";
 import { ConfigError } from "../../config/config-schema.js";
 import type { CliIo } from "../io.js";
@@ -11,8 +12,8 @@ export async function runRemove(args: readonly string[], io: CliIo): Promise<num
   const target = args[0]!;
 
   try {
-    const store = new ConfigStore();
-    const removed = store.remove(target);
+    const service = new WorkspaceAdminService({ configStore: new ConfigStore() });
+    const removed = await service.remove(target);
     writeLine(io.out, `Removed workspace "${removed.name}" (id: ${removed.workspace_id})`);
     return 0;
   } catch (error) {

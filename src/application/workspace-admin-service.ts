@@ -1,32 +1,55 @@
 /**
  * Shared workspace administration application service
- * (`docs/v0.3-implementation-plan.md` §4, `docs/v0.3-technical-architecture-rfc.md` §6).
+ * (`docs/v0.3-implementation-plan.md` §4/§5, `docs/v0.3-technical-architecture-rfc.md` §6).
  *
  * CLI and (later) the Control API/WebUI both call this service so product
- * rules exist once. Storage mechanics stay in the injected `ConfigStore`;
- * authorization semantics are inherited unchanged: roots are canonicalized,
- * duplicate/overlapping roots are rejected, `workspace_id` and root are
- * immutable after creation, enabling revalidates the root, and removing a
- * workspace affects WorkspaceLens authorization only — never user files.
- *
- * Slice 0 boundary note: mutations still go through the store's unlocked
- * load/modify/save path. Slice 1 moves them onto the locked
- * `ConfigStore.mutate()` layer without changing this service's surface.
+ * rules exist once. Every mutation goes through the locked
+ * `ConfigStore.mutate()` read-modify-write layer, so concurrent CLI/WebUI
+ * shaped mutations cannot lose accepted changes. Authorization semantics are
+ * inherited unchanged: roots are canonicalized, duplicate/overlapping roots
+ * are rejected, `workspace_id` and root are immutable after creation,
+ * enabling revalidates the root, and removing a workspace affects
+ * WorkspaceLens authorization only — never user files.
  */
 import fs from "node:fs";
+import path from "node:path";
 import {
   ConfigError,
+  WORKSPACE_ID_MAX_LENGTH,
+  WORKSPACE_ID_PATTERN,
   WORKSPACE_NAME_MAX_LENGTH,
   type WorkspaceConfig,
+  type WorkspaceLensConfig,
 } from "../config/config-schema.js";
-import { ConfigStore, expandTilde } from "../config/config-store.js";
+import {
+  ConfigStore,
+  expandTilde,
+  sanitizeWorkspaceIdBase,
+  type ConfigMutationSyncPoints,
+} from "../config/config-store.js";
 
 export interface AddWorkspaceInput {
   root: string;
-  /** Display name. Also the identity base when `id` is absent. */
+  /** Display name. Also the identity base when `id` and `idBasis` are absent. */
   name?: string;
   /** Explicit stable identity; must be valid and unused. */
   id?: string;
+  /**
+   * Identity basis when `id` is absent: the display name (application
+   * default) or the canonical path base. The CLI passes `"path"` to preserve
+   * its v0.2 identity contract where `--name` is display-only.
+   */
+  idBasis?: "path" | "name";
+}
+
+/** Constructor dependencies: injected stores/adapters (implementation plan §4). */
+export interface WorkspaceAdminServiceDependencies {
+  configStore: ConfigStore;
+  /**
+   * Deterministic mutation seam (CFG-004): forwarded to every config
+   * mutation, invoked in-lock after the latest config is loaded.
+   */
+  syncPoints?: ConfigMutationSyncPoints;
 }
 
 /** Product view of one authorized workspace, including validation state. */
@@ -45,16 +68,18 @@ export interface RootValidation {
   reason?: string;
 }
 
-/** Constructor dependencies: injected stores/adapters (implementation plan §4). */
-export interface WorkspaceAdminServiceDependencies {
-  configStore: ConfigStore;
+export interface IdentityValidation {
+  ok: boolean;
+  reason?: string;
 }
 
 export class WorkspaceAdminService {
   private readonly configStore: ConfigStore;
+  private readonly syncPoints: ConfigMutationSyncPoints | undefined;
 
   constructor(dependencies: WorkspaceAdminServiceDependencies) {
     this.configStore = dependencies.configStore;
+    this.syncPoints = dependencies.syncPoints;
   }
 
   /** All authorized workspaces with their current validation state. */
@@ -72,7 +97,11 @@ export class WorkspaceAdminService {
    * path base when no name is given).
    */
   async add(input: AddWorkspaceInput): Promise<WorkspaceConfig> {
-    return this.configStore.add(input.root, { name: input.name, id: input.id, idBasis: "name" });
+    return this.configStore.add(input.root, {
+      name: input.name,
+      id: input.id,
+      idBasis: input.idBasis ?? "name",
+    });
   }
 
   /** Rename the display name; identity, root, and enabled state are untouched. */
@@ -83,15 +112,19 @@ export class WorkspaceAdminService {
         `Workspace name must be a string of length 1..${WORKSPACE_NAME_MAX_LENGTH}.`,
       );
     }
-    return this.updateWorkspace(workspaceId, (ws) => {
+    return this.mutateWorkspace((config) => {
+      const ws = requireWorkspace(config, workspaceId);
       ws.name = name;
+      return { next: config, result: { ...ws } };
     });
   }
 
   /** Disable authorization; the workspace behaves as unavailable to MCP. */
   async disable(workspaceId: string): Promise<WorkspaceConfig> {
-    return this.updateWorkspace(workspaceId, (ws) => {
+    return this.mutateWorkspace((config) => {
+      const ws = requireWorkspace(config, workspaceId);
       ws.enabled = false;
+      return { next: config, result: { ...ws } };
     });
   }
 
@@ -100,13 +133,15 @@ export class WorkspaceAdminService {
    * missing or inaccessible root is never silently re-enabled.
    */
   async enable(workspaceId: string): Promise<WorkspaceConfig> {
-    return this.updateWorkspace(workspaceId, (ws) => {
+    return this.mutateWorkspace((config) => {
+      const ws = requireWorkspace(config, workspaceId);
       if (!isAvailableRoot(ws.root)) {
         throw new ConfigError(
           `Cannot enable workspace "${ws.workspace_id}": root is missing or inaccessible: ${ws.root}`,
         );
       }
       ws.enabled = true;
+      return { next: config, result: { ...ws } };
     });
   }
 
@@ -130,18 +165,36 @@ export class WorkspaceAdminService {
     return { ok: true, canonicalRoot: fs.realpathSync(expanded) };
   }
 
-  private updateWorkspace(
-    workspaceId: string,
-    update: (ws: WorkspaceConfig) => void,
-  ): WorkspaceConfig {
-    const config = this.configStore.load();
-    const workspace = config.workspaces.find((ws) => ws.workspace_id === workspaceId);
-    if (workspace === undefined) {
-      throw new ConfigError(`No authorized workspace matches "${workspaceId}".`);
+  /** Suggest an identity for a root candidate: sanitized canonical path base. */
+  suggestIdentity(rootPath: string): string {
+    const validation = this.validateRoot(rootPath);
+    if (!validation.ok || validation.canonicalRoot === undefined) {
+      throw new ConfigError(validation.reason ?? `Invalid root: ${rootPath}`);
     }
-    update(workspace);
-    this.configStore.save(config);
-    return { ...workspace };
+    return sanitizeWorkspaceIdBase(path.basename(validation.canonicalRoot));
+  }
+
+  /**
+   * Validate a candidate identity for a NEW workspace: pattern, length, and
+   * uniqueness against the current configuration.
+   */
+  validateNewWorkspaceId(candidate: string): IdentityValidation {
+    if (!WORKSPACE_ID_PATTERN.test(candidate) || candidate.length > WORKSPACE_ID_MAX_LENGTH) {
+      return {
+        ok: false,
+        reason: `workspace_id must match ${WORKSPACE_ID_PATTERN} with length 1..${WORKSPACE_ID_MAX_LENGTH}.`,
+      };
+    }
+    if (this.configStore.load().workspaces.some((ws) => ws.workspace_id === candidate)) {
+      return { ok: false, reason: `workspace_id "${candidate}" is already in use.` };
+    }
+    return { ok: true };
+  }
+
+  private mutateWorkspace<T>(
+    mutation: (config: WorkspaceLensConfig) => { next: WorkspaceLensConfig; result: T },
+  ): T {
+    return this.configStore.mutate(mutation, { syncPoints: this.syncPoints });
   }
 }
 
@@ -152,4 +205,12 @@ function isAvailableRoot(root: string): boolean {
   } catch {
     return false;
   }
+}
+
+function requireWorkspace(config: WorkspaceLensConfig, workspaceId: string): WorkspaceConfig {
+  const workspace = config.workspaces.find((ws) => ws.workspace_id === workspaceId);
+  if (workspace === undefined) {
+    throw new ConfigError(`No authorized workspace matches "${workspaceId}".`);
+  }
+  return workspace;
 }

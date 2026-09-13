@@ -1,3 +1,4 @@
+import { WorkspaceAdminService } from "../../application/workspace-admin-service.js";
 import { ConfigStore, describeError } from "../../config/config-store.js";
 import { ConfigError } from "../../config/config-schema.js";
 import type { CliIo } from "../io.js";
@@ -46,8 +47,15 @@ export async function runAdd(args: readonly string[], io: CliIo): Promise<number
   }
 
   try {
-    const store = new ConfigStore();
-    const workspace = store.add(parsed.path, parsed.options);
+    // The CLI keeps its v0.2 identity contract: the identity derives from
+    // the canonical path base; `--name` is display-only.
+    const service = new WorkspaceAdminService({ configStore: new ConfigStore() });
+    const workspace = await service.add({
+      root: parsed.path,
+      name: parsed.options.name,
+      id: parsed.options.id,
+      idBasis: "path",
+    });
     writeLine(io.out, `Authorized workspace "${workspace.name}" (id: ${workspace.workspace_id})`);
     writeLine(io.out, `  root: ${workspace.root}`);
     return 0;

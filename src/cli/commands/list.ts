@@ -1,18 +1,19 @@
+import { WorkspaceAdminService } from "../../application/workspace-admin-service.js";
 import { ConfigStore } from "../../config/config-store.js";
 import type { CliIo } from "../io.js";
 import { writeLine } from "../io.js";
 
 export async function runList(_args: readonly string[], io: CliIo): Promise<number> {
-  const store = new ConfigStore();
-  const config = store.load();
+  const service = new WorkspaceAdminService({ configStore: new ConfigStore() });
+  const workspaces = service.list();
 
-  if (config.workspaces.length === 0) {
+  if (workspaces.length === 0) {
     writeLine(io.out, "No workspaces authorized. Use: workspace-lens add <path>");
     return 0;
   }
 
   const rows: string[][] = [["ID", "NAME", "ENABLED", "ROOT"]];
-  for (const ws of config.workspaces) {
+  for (const ws of workspaces) {
     rows.push([ws.workspace_id, ws.name, ws.enabled ? "yes" : "no", ws.root]);
   }
   const widths = [0, 1, 2, 3].map((column) =>

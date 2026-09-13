@@ -23,6 +23,7 @@ import {
   type WorkspaceConfig,
   type WorkspaceLensConfig,
 } from "./config-schema.js";
+import { acquireConfigLock, type ConfigLockOptions } from "./config-lock.js";
 
 /** Expand a leading `~/` so quoted shell arguments still resolve to home. */
 export function expandTilde(inputPath: string): string {
@@ -69,6 +70,21 @@ export interface AddWorkspaceOptions {
   idBasis?: "path" | "name";
 }
 
+/**
+ * Deterministic mutation seam (`docs/v0.3-test-contract.md` §5, CFG-004):
+ * invoked synchronously while the lock is held, after the latest config is
+ * loaded and before the mutation applies. Production code passes nothing;
+ * tests inject an observer to prove the in-lock base state is the latest.
+ */
+export interface ConfigMutationSyncPoints {
+  afterLoad?: (config: WorkspaceLensConfig) => void;
+}
+
+export interface ConfigMutationOptions {
+  lock?: ConfigLockOptions;
+  syncPoints?: ConfigMutationSyncPoints;
+}
+
 export class ConfigStore {
   readonly filePath: string;
 
@@ -111,65 +127,97 @@ export class ConfigStore {
   }
 
   /**
+   * Locked read-modify-write mutation (`docs/v0.3-implementation-plan.md` §5):
+   * acquire the inter-process lock, load the latest config, apply one
+   * intent-level mutation, validate the result, then atomically replace the
+   * file (temp write 0600 + rename) and release the lock. Any failure —
+   * including a rejected mutation result — leaves the previous config on
+   * disk untouched. No product path may mutate the config outside this
+   * layer.
+   */
+  mutate<T>(
+    mutation: (config: WorkspaceLensConfig) => { next: WorkspaceLensConfig; result: T },
+    options: ConfigMutationOptions = {},
+  ): T {
+    const lock = acquireConfigLock(this.filePath, options.lock);
+    try {
+      const config = this.load();
+      options.syncPoints?.afterLoad?.(config);
+      const { next, result } = mutation(config);
+      const validated = parseConfig(next);
+      this.save(validated);
+      return result;
+    } finally {
+      // Release failure can only mean a stolen (stale) lock; the bounded
+      // staleness window already covers recovery, so it must not mask the
+      // mutation result.
+      try {
+        lock.release();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  /**
    * Authorize a new workspace root. The root must currently exist as a
    * directory; it is canonicalized before saving. Duplicate and overlapping
    * roots are rejected.
    */
   add(rootPath: string, options: AddWorkspaceOptions = {}): WorkspaceConfig {
     const canonical = this.canonicalizeExistingRoot(rootPath);
-    const config = this.load();
-
-    for (const existing of config.workspaces) {
-      const existingCanonical = canonicalizeRootCandidate(existing.root);
-      if (existingCanonical === canonical) {
-        throw new ConfigError(
-          `This root is already authorized as workspace "${existing.workspace_id}".`,
-        );
+    return this.mutate((config) => {
+      for (const existing of config.workspaces) {
+        const existingCanonical = canonicalizeRootCandidate(existing.root);
+        if (existingCanonical === canonical) {
+          throw new ConfigError(
+            `This root is already authorized as workspace "${existing.workspace_id}".`,
+          );
+        }
+        if (isPathContained(existingCanonical, canonical) || isPathContained(canonical, existingCanonical)) {
+          throw new ConfigError(
+            `This root overlaps the already-authorized workspace "${existing.workspace_id}".`,
+          );
+        }
       }
-      if (isPathContained(existingCanonical, canonical) || isPathContained(canonical, existingCanonical)) {
-        throw new ConfigError(
-          `This root overlaps the already-authorized workspace "${existing.workspace_id}".`,
-        );
-      }
-    }
 
-    const name = options.name?.trim() || path.basename(canonical);
-    const identityBase = options.idBasis === "name" ? name : path.basename(canonical);
-    const workspace_id = options.id !== undefined
-      ? validatedExplicitId(options.id, config)
-      : deriveUniqueId(identityBase, config);
+      const name = options.name?.trim() || path.basename(canonical);
+      const identityBase = options.idBasis === "name" ? name : path.basename(canonical);
+      const workspace_id = options.id !== undefined
+        ? validatedExplicitId(options.id, config)
+        : deriveUniqueId(identityBase, config);
 
-    const workspace: WorkspaceConfig = {
-      workspace_id,
-      name,
-      root: canonical,
-      enabled: true,
-    };
-    config.workspaces.push(workspace);
-    this.save(config);
-    return workspace;
+      const workspace: WorkspaceConfig = {
+        workspace_id,
+        name,
+        root: canonical,
+        enabled: true,
+      };
+      config.workspaces.push(workspace);
+      return { next: config, result: workspace };
+    });
   }
 
   /** Remove by workspace_id, or by exact name when the name is unambiguous. */
   remove(idOrName: string): WorkspaceConfig {
-    const config = this.load();
-    let index = config.workspaces.findIndex((ws) => ws.workspace_id === idOrName);
-    if (index === -1) {
-      const byName = config.workspaces.filter((ws) => ws.name === idOrName);
-      if (byName.length === 1) {
-        index = config.workspaces.indexOf(byName[0]!);
-      } else if (byName.length > 1) {
-        throw new ConfigError(
-          `Workspace name "${idOrName}" is ambiguous; remove by workspace_id instead.`,
-        );
+    return this.mutate((config) => {
+      let index = config.workspaces.findIndex((ws) => ws.workspace_id === idOrName);
+      if (index === -1) {
+        const byName = config.workspaces.filter((ws) => ws.name === idOrName);
+        if (byName.length === 1) {
+          index = config.workspaces.indexOf(byName[0]!);
+        } else if (byName.length > 1) {
+          throw new ConfigError(
+            `Workspace name "${idOrName}" is ambiguous; remove by workspace_id instead.`,
+          );
+        }
       }
-    }
-    if (index === -1) {
-      throw new ConfigError(`No authorized workspace matches "${idOrName}".`);
-    }
-    const [removed] = config.workspaces.splice(index, 1);
-    this.save(config);
-    return removed!;
+      if (index === -1) {
+        throw new ConfigError(`No authorized workspace matches "${idOrName}".`);
+      }
+      const [removed] = config.workspaces.splice(index, 1);
+      return { next: config, result: removed! };
+    });
   }
 
   private canonicalizeExistingRoot(rootPath: string): string {
@@ -199,7 +247,8 @@ function validatedExplicitId(id: string, config: WorkspaceLensConfig): string {
   return id;
 }
 
-function sanitizeIdBase(base: string): string {
+/** Sanitize a free-form base (path segment or display name) into an id candidate. */
+export function sanitizeWorkspaceIdBase(base: string): string {
   const sanitized = base
     .replace(/[^A-Za-z0-9._-]+/g, "-")
     .replace(/^[-.]+|[-.]+$/g, "")
@@ -208,7 +257,7 @@ function sanitizeIdBase(base: string): string {
 }
 
 function deriveUniqueId(base: string, config: WorkspaceLensConfig): string {
-  const first = sanitizeIdBase(base);
+  const first = sanitizeWorkspaceIdBase(base);
   if (!config.workspaces.some((ws) => ws.workspace_id === first)) {
     return first;
   }
