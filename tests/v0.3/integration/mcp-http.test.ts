@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { describe, expect, it } from "vitest";
@@ -263,4 +264,65 @@ describe("MCP HTTP — read-only tools over the Control Runtime", () => {
       }
     });
   });
+
+  it("rejects an oversized CHUNKED body (no Content-Length) with a stable 413 and keeps serving", async () => {
+    await withRuntime("mcphttp-chunked", async (child) => {
+      // The contract path a Content-Length check cannot see: a chunked
+      // upload with NO declared length, streamed through node:http.request.
+      // The byte-counting read must stop caching, deliver the stable 413
+      // envelope FIRST, and only then tear the connection down — the client
+      // reads 413, not a connection reset.
+      const result = await postChunked(child.url, 1536 * 1024);
+      expect(result.status).toBe(413);
+      expect(result.body).toMatch(/size/i);
+
+      // The runtime keeps serving normally afterwards.
+      const client = await connectMcpHttp(child.url);
+      try {
+        const list = await client.callTool({ name: "workspace_list", arguments: {} });
+        expect(list.isError).toBeFalsy();
+      } finally {
+        await client.close();
+      }
+    });
+  });
 });
+
+/**
+ * POST a chunked body WITHOUT a Content-Length header, reporting the first
+ * HTTP response (or the connection error) — the exact path a declared-length
+ * check cannot cover.
+ */
+function postChunked(url: string, totalBytes: number): Promise<{ status?: number; body: string }> {
+  return new Promise((resolve) => {
+    const request = http.request(
+      `${url}/mcp`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "transfer-encoding": "chunked" },
+      },
+      (response) => {
+        let body = "";
+        response.on("data", (chunk: Buffer) => {
+          body += chunk.toString("utf8");
+        });
+        response.on("end", () => resolve({ status: response.statusCode ?? undefined, body }));
+        response.on("error", () => resolve({ body }));
+      },
+    );
+    request.on("error", () => resolve({ body: "" }));
+    const filler = "x".repeat(64 * 1024);
+    let written = 0;
+    const writeMore = (): void => {
+      while (written < totalBytes) {
+        written += filler.length;
+        if (!request.write(filler)) {
+          request.once("drain", writeMore);
+          return;
+        }
+      }
+      request.end();
+    };
+    writeMore();
+  });
+}

@@ -56,7 +56,15 @@ export function createControlApp(options: ControlAppOptions): Hono {
   });
 
   // Security baseline: bounded request bodies before unbounded processing.
+  // The raw `/mcp` surface is exempt here: the MCP bridge owns its entire
+  // body bound with an actual byte-counting read (covering chunked bodies a
+  // Content-Length check cannot see) and answers with the one JSON-RPC
+  // envelope.
   app.use("*", async (context, next) => {
+    if (context.req.path === "/mcp") {
+      await next();
+      return;
+    }
     const contentLength = Number(context.req.header("content-length") ?? "0");
     if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
       return context.json(

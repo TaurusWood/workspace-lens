@@ -126,20 +126,30 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   const port = options.port ?? 0;
   const mcpBridge = createMcpHttpBridge({ configPath: options.configPath, logger: new StderrLogger() });
   let stopped = false;
-  const stop = async (): Promise<void> => {
+  let stopPromise: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
     if (stopped) {
-      return;
+      return Promise.resolve();
     }
-    stopped = true;
-    // Hold singleton ownership until the listener is FULLY stopped: while
-    // connections may still drain, releasing the lock could let a second
-    // manager bind (a different ephemeral port) and coexist. State and lock
-    // cleanup follow only after the port is released.
-    if (server !== undefined) {
-      await stopServer(server);
-    }
-    clearRuntimeState(runtimeStatePath);
-    lock.handle.release();
+    // Concurrent and repeated callers share ONE shutdown promise: every
+    // stop() resolves only when the listener is fully stopped and the lock
+    // is released, never before.
+    stopPromise ??= (async () => {
+      stopped = true;
+      // Hold singleton ownership until the listener is FULLY stopped: while
+      // connections may still drain, releasing the lock could let a second
+      // manager bind (a different ephemeral port) and coexist. State and
+      // lock cleanup follow only after the port is released.
+      try {
+        if (server !== undefined) {
+          await stopServer(server);
+        }
+      } finally {
+        clearRuntimeState(runtimeStatePath);
+        lock.handle.release();
+      }
+    })();
+    return stopPromise;
   };
   // Unified rollback: from the moment the listener exists until the handle
   // is fully delivered, ANY failure closes the server and releases the lock

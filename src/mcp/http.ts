@@ -44,9 +44,16 @@ export interface McpHttpBridgeOptions {
  * from the raw Node request — not by trusting a Content-Length header. This
  * is the security-contract body bound for the raw `/mcp` surface: an
  * oversized or chunked body is rejected before the SDK transport ever sees
- * it, and the connection is torn down.
+ * it. The bridge OWNS the entire `/mcp` body bound (the generic middleware
+ * skips this path), so there is exactly one envelope for it.
  */
 export const MAX_MCP_BODY_BYTES = 1024 * 1024;
+
+const OVERSIZED_ENVELOPE = JSON.stringify({
+  jsonrpc: "2.0",
+  id: null,
+  error: { code: -32000, message: "Request body exceeds the accepted size." },
+});
 
 async function readBoundedBody(incoming: IncomingMessage): Promise<
   { ok: true; body: Buffer } | { ok: false; reason: "too-large" | "aborted" }
@@ -55,6 +62,7 @@ async function readBoundedBody(incoming: IncomingMessage): Promise<
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
+    let tooLarge = false;
     const finish = (result: { ok: true; body: Buffer } | { ok: false; reason: "too-large" | "aborted" }): void => {
       if (!settled) {
         settled = true;
@@ -62,18 +70,27 @@ async function readBoundedBody(incoming: IncomingMessage): Promise<
       }
     };
     incoming.on("data", (chunk: Buffer) => {
+      if (tooLarge) {
+        return; // stop caching; the response is being written
+      }
       total += chunk.length;
       if (total > MAX_MCP_BODY_BYTES) {
-        incoming.destroy();
+        tooLarge = true;
+        // Stop consuming the upload WITHOUT destroying anything yet: the
+        // caller still needs the socket to deliver the stable 413 envelope.
+        incoming.pause();
         finish({ ok: false, reason: "too-large" });
         return;
       }
       chunks.push(chunk);
     });
-    incoming.on("end", () => finish({ ok: true, body: Buffer.concat(chunks) }));
-    incoming.on("error", () => finish({ ok: false, reason: "aborted" }));
-    incoming.on("close", () => {
-      if (!incoming.readableEnded) {
+    incoming.on("end", () => {
+      if (!tooLarge) {
+        finish({ ok: true, body: Buffer.concat(chunks) });
+      }
+    });
+    incoming.on("error", () => {
+      if (!tooLarge) {
         finish({ ok: false, reason: "aborted" });
       }
     });
@@ -92,19 +109,25 @@ export function createMcpHttpBridge(options: McpHttpBridgeOptions): McpHttpBridg
       metrics.lastRequestAt = Date.now();
       try {
         // Bounded body read BEFORE anything touches the payload: an
-        // oversized/chunked body is rejected with a stable JSON-RPC envelope
-        // and the socket is destroyed (no unbounded buffering).
+        // oversized/chunked body is rejected with the stable JSON-RPC
+        // envelope — the response is written and flushed FIRST, and only
+        // then the still-uploading connection is closed, so clients receive
+        // the 413 instead of a connection reset.
         const body = await readBoundedBody(incoming);
         if (!body.ok) {
-          if (!outgoing.headersSent) {
-            outgoing.writeHead(413, { "content-type": "application/json" });
-            outgoing.end(
-              JSON.stringify({
-                jsonrpc: "2.0",
-                id: null,
-                error: { code: -32000, message: "Request body exceeds the accepted size." },
-              }),
-            );
+          if (body.reason === "too-large") {
+            if (!outgoing.headersSent) {
+              outgoing.writeHead(413, {
+                "content-type": "application/json",
+                connection: "close",
+              });
+            }
+            outgoing.end(OVERSIZED_ENVELOPE, () => {
+              // Response flushed: now stop the client's continued upload.
+              incoming.destroy();
+            });
+          } else if (!outgoing.headersSent) {
+            outgoing.destroy();
           }
           return;
         }
