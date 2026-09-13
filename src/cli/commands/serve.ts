@@ -2,7 +2,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ConfigStore, describeError } from "../../config/config-store.js";
 import { ConfigError } from "../../config/config-schema.js";
 import { LiveWorkspaceRegistry } from "../../core/live-workspace-registry.js";
-import type { WorkspaceRegistry } from "../../core/workspace-registry.js";
+import type { WorkspaceRegistrySource } from "../../core/workspace-registry.js";
 import { StderrLogger } from "../../core/logger.js";
 import { createToolContext, createWorkspaceLensServer } from "../../mcp/server.js";
 
@@ -14,12 +14,13 @@ import { createToolContext, createWorkspaceLensServer } from "../../mcp/server.j
 export async function runServe(): Promise<number> {
   const logger = new StderrLogger();
 
-  let registry: WorkspaceRegistry;
+  let registry: WorkspaceRegistrySource;
   try {
-    // Live authorization: every request resolves the current validated
-    // config, so administration changes apply without a restart. The
-    // construction-time load still fails fast on a malformed config.
     const store = new ConfigStore();
+    // Startup fail-fast is unchanged (v0.2 behavior): a malformed config
+    // must prevent startup entirely. From then on, authorization is live —
+    // each MCP request resolves the current config exactly once.
+    store.load();
     registry = new LiveWorkspaceRegistry(() => store.load());
   } catch (error) {
     if (error instanceof ConfigError) {

@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { AccessPolicy } from "../core/access-policy.js";
 import { DEFAULT_LIMITS, type ServerLimits } from "../core/limits.js";
 import { type Logger, StderrLogger } from "../core/logger.js";
-import type { WorkspaceRegistry } from "../core/workspace-registry.js";
+import type { WorkspaceRegistrySource } from "../core/workspace-registry.js";
 import { SERVER_NAME, SERVER_VERSION } from "../version.js";
 import type { ToolContext } from "./context.js";
 import { createToolHandler } from "./tool-runner.js";
@@ -24,7 +24,7 @@ export interface ServerOptions {
 }
 
 export function createToolContext(
-  options: ServerOptions & { registry: WorkspaceRegistry },
+  options: ServerOptions & { registry: WorkspaceRegistrySource },
 ): ToolContext {
   return {
     limits: { ...DEFAULT_LIMITS, ...options.limits },

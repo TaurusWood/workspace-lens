@@ -5,6 +5,11 @@
  * The registry is the only source of workspace identity for MCP tools:
  * access always resolves from a configured `workspace_id`, never from a
  * caller-supplied root path (`security-model.md` §4.2).
+ *
+ * A registry instance is an immutable snapshot of one validated config. It
+ * doubles as a `WorkspaceRegistrySource` for itself; live authorization is
+ * provided by `LiveWorkspaceRegistry`, which resolves a fresh snapshot per
+ * request instead.
  */
 import fs from "node:fs";
 import { AppError } from "./errors.js";
@@ -16,6 +21,15 @@ export interface RegisteredWorkspace {
   /** Canonical absolute root path. Internal use; never returned to MCP clients by default. */
   root: string;
   enabled: boolean;
+}
+
+/**
+ * Request-scoped resolution seam (live authorization,
+ * `docs/v0.3-technical-architecture-rfc.md` §9): called exactly once per
+ * MCP request; the returned snapshot serves the whole request.
+ */
+export interface WorkspaceRegistrySource {
+  currentRegistry(): WorkspaceRegistry;
 }
 
 function toRegistered(ws: WorkspaceConfig): RegisteredWorkspace {
@@ -30,12 +44,11 @@ export class WorkspaceRegistry {
   }
 
   /**
-   * The config snapshot all registry methods observe. The static registry
-   * serves one fixed snapshot; the live registry overrides this to resolve
-   * the current validated config for every authorization decision.
+   * A static registry IS its own (immutable) snapshot; live sources
+   * override this to load the current validated config per request.
    */
-  protected get snapshot(): WorkspaceLensConfig {
-    return this.config;
+  currentRegistry(): WorkspaceRegistry {
+    return this;
   }
 
   /**
@@ -43,21 +56,21 @@ export class WorkspaceRegistry {
    * canonical absolute root path (`mcp-tools-spec.md` §7).
    */
   get exposeAbsolutePaths(): boolean {
-    return this.snapshot.expose_absolute_paths;
+    return this.config.expose_absolute_paths;
   }
 
   /** All registered workspaces, including disabled ones. */
   listAll(): RegisteredWorkspace[] {
-    return this.snapshot.workspaces.map(toRegistered);
+    return this.config.workspaces.map(toRegistered);
   }
 
   /** Workspaces visible to MCP callers: explicitly authorized and enabled. */
   listEnabled(): RegisteredWorkspace[] {
-    return this.snapshot.workspaces.filter((ws) => ws.enabled).map(toRegistered);
+    return this.config.workspaces.filter((ws) => ws.enabled).map(toRegistered);
   }
 
   findById(workspaceId: string): RegisteredWorkspace | undefined {
-    const ws = this.snapshot.workspaces.find((entry) => entry.workspace_id === workspaceId);
+    const ws = this.config.workspaces.find((entry) => entry.workspace_id === workspaceId);
     return ws ? toRegistered(ws) : undefined;
   }
 

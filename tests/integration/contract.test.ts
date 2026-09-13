@@ -185,8 +185,9 @@ describe("MCP contract suite", () => {
       expect(result.isError, `${tool} must reject caller-controlled primitives`).toBe(true);
       expect(JSON.stringify(result)).toContain("Unrecognized key");
     }
-    // The registry itself is untouched.
-    expect(context.registry.findById("etc")).toBeUndefined();
+    // The registry itself is untouched (resolved through the request
+    // source; a static registry resolves to its own snapshot).
+    expect(context.registry.currentRegistry().findById("etc")).toBeUndefined();
   });
 
   // ---------------------------------------------------------------------

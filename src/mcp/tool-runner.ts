@@ -11,7 +11,7 @@
 import type { z } from "zod";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { errorEnvelope, type ToolEnvelope } from "../core/errors.js";
-import type { ToolContext } from "./context.js";
+import type { ToolContext, ToolRequestContext } from "./context.js";
 
 export interface ToolDefinition<TSchema extends z.ZodType = z.ZodType> {
   name: string;
@@ -19,7 +19,7 @@ export interface ToolDefinition<TSchema extends z.ZodType = z.ZodType> {
   inputSchema: TSchema;
   run: (
     args: z.output<TSchema>,
-    context: ToolContext,
+    context: ToolRequestContext,
   ) => Promise<ToolEnvelope<unknown>> | ToolEnvelope<unknown>;
 }
 
@@ -62,7 +62,13 @@ export function createToolHandler<TSchema extends z.ZodType>(
     };
 
     try {
-      const envelope = await definition.run(parsedArgs, context);
+      // Request-scoped resolution (RFC §9): the current validated config
+      // snapshot is loaded EXACTLY ONCE per request and the whole tool run
+      // executes against that immutable snapshot. A malformed or unreadable
+      // config fails closed here, before any tool logic runs.
+      const registry = context.registry.currentRegistry();
+      const requestContext: ToolRequestContext = { ...context, registry };
+      const envelope = await definition.run(parsedArgs, requestContext);
       logResult(envelope);
       return toCallToolResult(envelope, !envelope.ok);
     } catch (thrown) {
