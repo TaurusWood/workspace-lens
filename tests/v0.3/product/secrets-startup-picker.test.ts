@@ -136,6 +136,11 @@ describe("PICK — folder picker adapter contracts", () => {
   it("PICK-001 revalidates any picker-returned path through shared workspace authorization rules", async () => {
     const { FolderPicker } = await importExpected("folderPicker");
     const { WorkspaceAdminService } = await importExpected("workspaceAdminService");
+    const { ConfigStore } = await import("../../../src/config/config-store.js");
+    const { makeTempRoot } = await import("../../helpers/fixtures.js");
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+
     const invalidPath = "/nonexistent/wl-pick-001";
     const picker = new FolderPicker({
       adapter: pickerAdapter({ available: true, canceled: false, directory: invalidPath }),
@@ -146,8 +151,15 @@ describe("PICK — folder picker adapter contracts", () => {
     // The picker only selects a path. Authorization remains the shared
     // application service's responsibility, so picker output cannot bypass
     // canonicalization/existence/security rules.
-    const service = new WorkspaceAdminService();
-    await expect(service.add({ root: selected.directory })).rejects.toThrow();
+    const configDir = makeTempRoot("wl-v03-picker-auth-");
+    try {
+      const service = new WorkspaceAdminService({
+        configStore: new ConfigStore(path.join(configDir, "config.json")),
+      });
+      await expect(service.add({ root: selected.directory })).rejects.toThrow();
+    } finally {
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
   });
 
   it("PICK-002 treats picker cancellation as a no-op", async () => {
