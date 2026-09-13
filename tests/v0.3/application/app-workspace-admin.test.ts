@@ -161,6 +161,9 @@ describe("APP — workspace administration through the shared application servic
 
       // Once the root exists again, enabling succeeds and revalidates.
       fs.mkdirSync(workspace.root, { recursive: true });
+      // Restore the sentinel exactly as the fixture wrote it (its parent
+      // directory is part of the workspace content).
+      fs.mkdirSync(path.dirname(path.join(workspace.root, workspace.sentinelFile)), { recursive: true });
       fs.writeFileSync(path.join(workspace.root, workspace.sentinelFile), workspace.sentinelContent);
       await service.enable(added.workspace_id);
       const enabled = service.list().find((ws: any) => ws.workspace_id === added.workspace_id) as any;

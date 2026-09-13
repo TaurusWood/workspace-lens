@@ -60,6 +60,13 @@ export function isPathContained(ancestor: string, candidate: string): boolean {
 export interface AddWorkspaceOptions {
   name?: string;
   id?: string;
+  /**
+   * Basis for deriving the `workspace_id` when `id` is absent: the canonical
+   * path base (default, existing behavior) or the display name (shared
+   * application add contract). The derivation mechanics (sanitizing and
+   * uniqueness suffix) are identical for both bases.
+   */
+  idBasis?: "path" | "name";
 }
 
 export class ConfigStore {
@@ -126,10 +133,11 @@ export class ConfigStore {
       }
     }
 
+    const name = options.name?.trim() || path.basename(canonical);
+    const identityBase = options.idBasis === "name" ? name : path.basename(canonical);
     const workspace_id = options.id !== undefined
       ? validatedExplicitId(options.id, config)
-      : deriveUniqueId(path.basename(canonical), config);
-    const name = options.name?.trim() || path.basename(canonical);
+      : deriveUniqueId(identityBase, config);
 
     const workspace: WorkspaceConfig = {
       workspace_id,

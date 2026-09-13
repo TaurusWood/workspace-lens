@@ -1,0 +1,87 @@
+/**
+ * v0.3 application service contracts (`docs/v0.3-implementation-plan.md` §4).
+ *
+ * These interfaces fix the shared application seams that CLI and WebUI must
+ * both call instead of owning independent business rules
+ * (`docs/v0.3-technical-architecture-rfc.md` §6). `WorkspaceAdminService` is
+ * implemented in Slice 0; the services below are contracts only and are
+ * implemented by their owning slices (DiagnosticsService — Slice 5,
+ * PromptHelperService — Slice 8, ConnectionService — Slice 6,
+ * SettingsService — Slice 9).
+ *
+ * The application layer stays framework-independent: no Hono (HTTP adapter)
+ * and no React (UI) types or dependencies may appear here.
+ */
+
+/**
+ * Structured factual diagnostics check. CLI `doctor` and the Control API
+ * diagnostics both render from these results (`v0.3-test-contract.md` §12).
+ */
+export type DiagnosticsGroupId = "local-runtime" | "workspaces" | "provider-integration";
+
+export type DiagnosticsCheckStatus = "ok" | "warning" | "error";
+
+export interface DiagnosticsCheck {
+  /** Stable check identifier (for example `config-readable`). */
+  id: string;
+  group: DiagnosticsGroupId;
+  status: DiagnosticsCheckStatus;
+  /** Concise factual message; never includes secrets or file contents. */
+  message: string;
+  /** Optional safe, product-owned next action. */
+  action?: string;
+}
+
+export interface DiagnosticsService {
+  /** Run all checks and return structured results grouped by `group`. */
+  run(): Promise<DiagnosticsCheck[]>;
+}
+
+/**
+ * Normalized managed-runtime states produced by the tunnel adapter
+ * (`docs/v0.3-implementation-plan.md` §10). Raw provider/process schema must
+ * not leak past this vocabulary.
+ */
+export type TunnelRuntimeState =
+  | "missing"
+  | "stopped"
+  | "starting"
+  | "healthy"
+  | "unhealthy"
+  | "recovering"
+  | "problem";
+
+export interface ConnectionStatusResult {
+  state: TunnelRuntimeState;
+  /** Safe next step for the user when the state is not healthy. */
+  nextAction?: string;
+}
+
+export interface ConnectionService {
+  status(): Promise<ConnectionStatusResult>;
+  connect(): Promise<ConnectionStatusResult>;
+  start(): Promise<ConnectionStatusResult>;
+  stop(): Promise<ConnectionStatusResult>;
+  restart(): Promise<ConnectionStatusResult>;
+}
+
+/**
+ * Non-secret product preferences persisted separately from authorization
+ * config (`docs/v0.3-technical-architecture-rfc.md` §7.2). Concrete DTOs are
+ * fixed by the control-state schema in Slice 9.
+ */
+export interface SettingsService {
+  get(): Promise<Record<string, unknown>>;
+  patch(patch: Record<string, unknown>): Promise<Record<string, unknown>>;
+}
+
+export type PromptHelperKind = "project-instructions" | "review-prompt" | "plan-prompt";
+
+export interface PromptHelperService {
+  /**
+   * Generate one optional helper from stable workspace identity
+   * (`v0.3-test-contract.md` §12 HELP-001/002). Stateless: no saved prompt
+   * library and no workflow/session records.
+   */
+  generate(kind: PromptHelperKind, workspaceId: string): Promise<string>;
+}
