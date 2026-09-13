@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import http from "node:http";
+import path from "node:path";
+import type { AddressInfo } from "node:net";
 import { importExpected } from "../helpers/expected-module.js";
 import {
   assertNoRealUserState,
@@ -6,6 +10,7 @@ import {
   type IsolatedProductEnv,
 } from "../helpers/isolated-env.js";
 import { readRuntimeIdentity, spawnProductChild, type ProductChild } from "../helpers/spawn-product-child.js";
+import { startControlRuntime } from "../../../src/control/runtime.js";
 
 /**
  * L2 — Control Runtime and HTTP Integration Contracts: HTTP-001..004
@@ -160,6 +165,155 @@ describe("HTTP — Control Runtime and HTTP integration", () => {
     } finally {
       await second?.stop();
       await first?.stop();
+      env.cleanup();
+    }
+  });
+});
+
+/**
+ * Stale runtime lock behavior (implementation plan §7 "stale runtime lock
+ * behavior") and lifecycle atomicity — R2 review contracts. These run the
+ * REAL startControlRuntime in-process against an isolated state root and
+ * pin the recovery/lifecycle semantics the shared owner-lock primitive and
+ * the runtime must satisfy.
+ */
+describe("HTTP — runtime lock recovery and lifecycle atomicity", () => {
+  function writeStaleLock(env: IsolatedProductEnv, ownerFileName: string, payload: string): void {
+    const lockDir = path.join(env.runtimeStatePath, "control.lock");
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, ownerFileName), payload, { mode: 0o600 });
+  }
+
+  it("reclaims a DEAD owner's lock and starts normally", async () => {
+    await importExpected("controlRuntime");
+    const env = createIsolatedProductEnv("lock-dead");
+    let runtime: Awaited<ReturnType<typeof startControlRuntime>> | undefined;
+    try {
+      assertNoRealUserState(env);
+      writeStaleLock(env, "owner-dead-token", JSON.stringify({ token: "dead-token", pid: 999_999_999 }));
+      runtime = await startControlRuntime({
+        configPath: env.configPath,
+        runtimeStatePath: env.runtimeStatePath,
+        port: 0,
+      });
+      expect(runtime.reused).toBe(false);
+      expect(await fetch(`${runtime.url}/healthz`)).toMatchObject({ status: 200 });
+    } finally {
+      await runtime?.runtime.stop();
+      env.cleanup();
+    }
+  });
+
+  it("refuses to take over a LIVE owner's lock", async () => {
+    await importExpected("controlRuntime");
+    const env = createIsolatedProductEnv("lock-live");
+    try {
+      assertNoRealUserState(env);
+      // A live owner (this test process) holds the lock; no healthy runtime
+      // endpoint exists to reuse.
+      writeStaleLock(env, "owner-live-token", JSON.stringify({ token: "live-token", pid: process.pid }));
+      await expect(
+        startControlRuntime({ configPath: env.configPath, runtimeStatePath: env.runtimeStatePath, port: 0 }),
+      ).rejects.toThrow(/already running|ownership/i);
+      // The live lock survives untouched.
+      expect(fs.existsSync(path.join(env.runtimeStatePath, "control.lock"))).toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("fails BUSY on a fresh corrupt lock remnant and reclaims it after the age-out", async () => {
+    await importExpected("controlRuntime");
+    const env = createIsolatedProductEnv("lock-corrupt");
+    let runtime: Awaited<ReturnType<typeof startControlRuntime>> | undefined;
+    try {
+      assertNoRealUserState(env);
+      const startedAt = Date.now();
+      writeStaleLock(env, "owner-fresh-corrupt", "{ crashed mid-wri");
+      await expect(
+        startControlRuntime({ configPath: env.configPath, runtimeStatePath: env.runtimeStatePath, port: 0 }),
+      ).rejects.toThrow(/already running|ownership/i);
+      // Busy came back promptly (no synchronous spin until the age-out).
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      // The fresh remnant was NOT reclaimed.
+      expect(fs.existsSync(path.join(env.runtimeStatePath, "control.lock"))).toBe(true);
+
+      // After aging out, the same remnant is reclaimed and startup succeeds.
+      const lockDir = path.join(env.runtimeStatePath, "control.lock");
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(lockDir, past, past);
+      runtime = await startControlRuntime({
+        configPath: env.configPath,
+        runtimeStatePath: env.runtimeStatePath,
+        port: 0,
+      });
+      expect(await fetch(`${runtime.url}/healthz`)).toMatchObject({ status: 200 });
+    } finally {
+      await runtime?.runtime.stop();
+      env.cleanup();
+    }
+  });
+
+  it("rolls back atomically when post-listen initialization fails and frees the lock", async () => {
+    await importExpected("controlRuntime");
+    const env = createIsolatedProductEnv("lock-rollback");
+    let runtime: Awaited<ReturnType<typeof startControlRuntime>> | undefined;
+    try {
+      assertNoRealUserState(env);
+      // Make the runtime state write fail (EISDIR): a runtime.json that is a
+      // DIRECTORY. Startup must fail WITHOUT leaving an orphan listener or
+      // holding the lock.
+      fs.mkdirSync(path.join(env.runtimeStatePath, "runtime.json"), { recursive: true });
+      await expect(
+        startControlRuntime({ configPath: env.configPath, runtimeStatePath: env.runtimeStatePath, port: 0 }),
+      ).rejects.toThrow(/start|Control Runtime/i);
+      // The singleton lock was released by the rollback: after removing the
+      // test fixture (the blocking directory), a subsequent start acquires
+      // the lock and serves.
+      fs.rmSync(path.join(env.runtimeStatePath, "runtime.json"), { recursive: true, force: true });
+      runtime = await startControlRuntime({
+        configPath: env.configPath,
+        runtimeStatePath: env.runtimeStatePath,
+        port: 0,
+      });
+      expect(await fetch(`${runtime.url}/healthz`)).toMatchObject({ status: 200 });
+    } finally {
+      await runtime?.runtime.stop();
+      env.cleanup();
+    }
+  });
+
+  it("refuses to REUSE an endpoint that does not prove the recorded runtime instance", async () => {
+    await importExpected("controlRuntime");
+    const env = createIsolatedProductEnv("lock-decoy");
+    const decoy = http.createServer((request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ status: "ok", runtime_instance_id: "some-other-service" }));
+    });
+    await new Promise<void>((resolve) => decoy.listen(0, "127.0.0.1", () => resolve()));
+    try {
+      assertNoRealUserState(env);
+      // A live lock (this process) plus a runtime state that names the SAME
+      // owner but points at a local service answering 200 with a DIFFERENT
+      // runtime_instance_id: reuse MUST be refused — identity proof, not
+      // just an HTTP 200.
+      const decoyPort = (decoy.address() as AddressInfo).port;
+      writeStaleLock(env, "owner-live-token", JSON.stringify({ token: "live-token", pid: process.pid }));
+      fs.writeFileSync(
+        path.join(env.runtimeStatePath, "runtime.json"),
+        JSON.stringify({
+          baseUrl: `http://127.0.0.1:${decoyPort}`,
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+          instanceId: "the-real-runtime-id",
+        }),
+        { mode: 0o600 },
+      );
+      await expect(
+        startControlRuntime({ configPath: env.configPath, runtimeStatePath: env.runtimeStatePath, port: 0 }),
+      ).rejects.toThrow(/already running|ownership|instance/i);
+    } finally {
+      await new Promise<void>((resolve) => decoy.close(() => resolve()));
       env.cleanup();
     }
   });

@@ -233,4 +233,34 @@ describe("MCP HTTP — read-only tools over the Control Runtime", () => {
       }
     });
   });
+
+  it("rejects an oversized request body before processing and keeps serving", async () => {
+    await withRuntime("mcphttp-body", async (child) => {
+      // A 1.5 MiB body exceeds the bounded limit; the byte-counting read must
+      // reject it with a stable envelope BEFORE the payload is processed.
+      const oversized = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "workspace_list", arguments: { filler: "x".repeat(1536 * 1024) } },
+      });
+      const rejected = await fetch(`${child.url}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: oversized,
+      });
+      expect(rejected.status).toBe(413);
+      const body = (await rejected.json()) as { error?: { message?: unknown } };
+      expect(String(body.error?.message)).toMatch(/size/i);
+
+      // The runtime keeps serving normally afterwards.
+      const client = await connectMcpHttp(child.url);
+      try {
+        const list = await client.callTool({ name: "workspace_list", arguments: {} });
+        expect(list.isError).toBeFalsy();
+      } finally {
+        await client.close();
+      }
+    });
+  });
 });

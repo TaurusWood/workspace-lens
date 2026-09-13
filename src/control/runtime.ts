@@ -83,19 +83,25 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   const lock = acquireRuntimeLock(runtimeStatePath);
 
   if (!lock.acquired) {
-    // A live owner holds the singleton. Reuse it when it is healthy;
-    // otherwise report an explicit ownership conflict — never start a
-    // duplicate manager.
+    // A live owner holds the singleton. Reuse it only when the runtime state
+    // names THE SAME owner and a live endpoint that proves the SAME instance
+    // identity — never a stale runtime.json pointing at an unrelated local
+    // service that merely answers 200. Everything else is an explicit
+    // ownership conflict; a duplicate manager is never started.
     const existing = readRuntimeState(runtimeStatePath);
-    const baseUrl = existing?.baseUrl;
-    if (baseUrl !== undefined && (await isHealthy(baseUrl))) {
+    if (
+      existing !== undefined &&
+      existing.pid === lock.ownerPid &&
+      isLoopbackBaseUrl(existing.baseUrl) &&
+      (await provesSameInstance(existing))
+    ) {
       return {
-        url: baseUrl,
-        baseUrl,
+        url: existing.baseUrl,
+        baseUrl: existing.baseUrl,
         reused: true,
         instanceId: "",
         runtime: {
-          baseUrl,
+          baseUrl: existing.baseUrl,
           // The reuser does not own the runtime; stopping it must not stop
           // the existing instance.
           stop(): Promise<void> {
@@ -104,17 +110,41 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
         },
       };
     }
+    const reason =
+      existing !== undefined
+        ? existing.pid === lock.ownerPid
+          ? `its endpoint ${existing.baseUrl} does not prove the recorded runtime instance`
+          : `the runtime state names pid ${existing.pid}, not the lock owner ${lock.ownerPid ?? "unknown"}`
+        : "its endpoint could not be discovered";
     throw new ConfigError(
       `Another Control Runtime instance is already running for this state ` +
-        `(owner pid ${lock.ownerPid ?? "unknown"} holds the runtime lock)` +
-        (baseUrl !== undefined ? ` but ${baseUrl} is not healthy.` : " and its endpoint could not be discovered."),
+        `(owner pid ${lock.ownerPid ?? "unknown"} holds the runtime lock) but ${reason}.`,
     );
   }
 
   const instanceId = randomUUID();
   const port = options.port ?? 0;
   const mcpBridge = createMcpHttpBridge({ configPath: options.configPath, logger: new StderrLogger() });
-  let server: ServerType;
+  let stopped = false;
+  const stop = async (): Promise<void> => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    // Hold singleton ownership until the listener is FULLY stopped: while
+    // connections may still drain, releasing the lock could let a second
+    // manager bind (a different ephemeral port) and coexist. State and lock
+    // cleanup follow only after the port is released.
+    if (server !== undefined) {
+      await stopServer(server);
+    }
+    clearRuntimeState(runtimeStatePath);
+    lock.handle.release();
+  };
+  // Unified rollback: from the moment the listener exists until the handle
+  // is fully delivered, ANY failure closes the server and releases the lock
+  // — a failed start can never leave an orphan listener holding ownership.
+  let server: ServerType | undefined;
   try {
     server = serve(
       {
@@ -127,60 +157,40 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
         hostname: "127.0.0.1",
       },
     );
-  } catch (error) {
-    lock.handle.release();
-    throw new ConfigError(
-      `Cannot start the Control Runtime on 127.0.0.1:${port}: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
-  // serve() returns before the listener is live; bind errors (e.g. port in
-  // use) surface on the error event.
-  try {
+    // serve() returns before the listener is live; bind errors (e.g. port in
+    // use) surface on the error event.
     await waitForListening(server);
-  } catch (error) {
-    lock.handle.release();
-    throw new ConfigError(
-      `Cannot start the Control Runtime on 127.0.0.1:${port}: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
-  const address = server.address();
-  if (address === null || typeof address === "string" || !isLoopbackAddress(address.address)) {
-    void stopServer(server);
-    lock.handle.release();
-    throw new ConfigError("Control Runtime refused to start: the listener is not loopback-only.");
-  }
-  const boundPort = address.port;
-  const baseUrl = `http://127.0.0.1:${boundPort}`;
-
-  writeRuntimeState(runtimeStatePath, {
-    baseUrl,
-    pid: process.pid,
-    startedAt: new Date().toISOString(),
-    instanceId,
-  });
-
-  let stopped = false;
-  const stop = async (): Promise<void> => {
-    if (stopped) {
-      return;
+    const address = server.address();
+    if (address === null || typeof address === "string" || !isLoopbackAddress(address.address)) {
+      throw new ConfigError("Control Runtime refused to start: the listener is not loopback-only.");
     }
-    stopped = true;
-    clearRuntimeState(runtimeStatePath);
+    const boundPort = address.port;
+    const baseUrl = `http://127.0.0.1:${boundPort}`;
+    writeRuntimeState(runtimeStatePath, {
+      baseUrl,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      instanceId,
+    });
+    return {
+      url: baseUrl,
+      baseUrl,
+      reused: false,
+      instanceId,
+      runtime: { baseUrl, stop },
+    };
+  } catch (error) {
+    if (server !== undefined) {
+      await stopServer(server);
+    }
     lock.handle.release();
-    await stopServer(server);
-  };
-
-  return {
-    url: baseUrl,
-    baseUrl,
-    reused: false,
-    instanceId,
-    runtime: { baseUrl, stop },
-  };
+    throw error instanceof ConfigError
+      ? error
+      : new ConfigError(
+          `Cannot start the Control Runtime on 127.0.0.1:${port}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+  }
 }
 
 /** Default state paths for the user-facing `workspace-lens control` command. */
@@ -227,10 +237,29 @@ function isLoopbackAddress(address: string): boolean {
   return address === "127.0.0.1" || address === "::1";
 }
 
-function isHealthy(baseUrl: string): Promise<boolean> {
-  return fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS) })
-    .then((response) => response.status === 200)
-    .catch(() => false);
+/** The reuse candidate must be a loopback URL — never an arbitrary host. */
+function isLoopbackBaseUrl(baseUrl: string): boolean {
+  return /^http:\/\/(127\.0\.0\.1|\[::1\]|localhost):\d+$/.test(baseUrl);
+}
+
+/**
+ * Identity proof for reuse: the endpoint must answer /healthz with the SAME
+ * runtime_instance_id recorded in the runtime state. A 200 from any other
+ * local service is not a WorkspaceLens runtime.
+ */
+async function provesSameInstance(state: RuntimeStateFile): Promise<boolean> {
+  try {
+    const response = await fetch(`${state.baseUrl}/healthz`, {
+      signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
+    });
+    if (response.status !== 200) {
+      return false;
+    }
+    const body = (await response.json()) as { runtime_instance_id?: unknown };
+    return body.runtime_instance_id === state.instanceId;
+  } catch {
+    return false;
+  }
 }
 
 function runtimeStateFile(runtimeStatePath: string): string {
