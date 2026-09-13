@@ -37,8 +37,6 @@ export interface ProductChildOptions {
 export interface ProductChild {
   /** Local WebUI/base URL reported by the product. */
   url: string;
-  /** PID of the child process (also the runtime owner in this harness). */
-  pid: number;
   /** Full result payload written by the child (url/pid/reused/...). */
   result: Record<string, any>;
   /**
@@ -149,7 +147,6 @@ try {
   });
   fs.writeFileSync(resultFile, JSON.stringify({
     url: result.url ?? result.baseUrl,
-    pid: process.pid,
     reused: result.reused === true,
     runtimeBaseUrl: result.runtime?.baseUrl ?? result.baseUrl ?? result.url,
     capturedCliInvocations: result.capturedCliInvocations ?? [],
@@ -168,6 +165,11 @@ try {
 }
 `;
   const scriptFile = path.join(childDir, "product-child.mjs");
+  // The wrapper child's own PID is deliberately NOT recorded as a runtime
+  // identity: the launcher and the long-lived Control Runtime may be
+  // different processes by design. Runtime identity is the
+  // "runtime_instance_id" exposed by the live runtime's /healthz (see
+  // readRuntimeIdentity), not any launcher PID.
   fs.writeFileSync(scriptFile, script);
 
   const child = spawn(process.execPath, [scriptFile], {
@@ -197,7 +199,6 @@ try {
 
   return {
     url,
-    pid: result.pid,
     result,
     async stop(options: { expectDrain?: boolean } = {}): Promise<void> {
       // Stop protocol: SIGTERM → child stops its runtime → port must drain.
@@ -212,6 +213,33 @@ try {
       fs.rmSync(childDir, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Read the LIVE Control Runtime's identity from its /healthz endpoint.
+ *
+ * Test contract for the runtime (Slice 3): the health response MUST include
+ * a `runtime_instance_id` — a non-empty string generated once when the
+ * runtime process starts — so tests can prove "no restart" without depending
+ * on launcher PIDs. E2E-003 (release-blocking) and START-001 rely on it.
+ */
+export async function readRuntimeIdentity(baseUrl: string): Promise<string> {
+  const response = await fetch(`${baseUrl}/healthz`);
+  expectHealthOk(response.status, baseUrl);
+  const body = (await response.json()) as { runtime_instance_id?: unknown };
+  if (typeof body.runtime_instance_id !== "string" || body.runtime_instance_id.length === 0) {
+    throw new Error(
+      "RUNTIME IDENTITY MISSING: /healthz must report a non-empty runtime_instance_id " +
+        "(test contract for 'no restart' evidence; launcher PIDs are not runtime identity).",
+    );
+  }
+  return body.runtime_instance_id;
+}
+
+function expectHealthOk(status: number, baseUrl: string): void {
+  if (status !== 200) {
+    throw new Error(`RUNTIME UNHEALTHY: ${baseUrl}/healthz returned ${status}`);
+  }
 }
 
 // Re-exported so generated child scripts and tests share one adapter source.

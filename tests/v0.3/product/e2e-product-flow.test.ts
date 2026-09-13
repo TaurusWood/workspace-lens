@@ -7,7 +7,7 @@ import {
   type IsolatedProductEnv,
 } from "../helpers/isolated-env.js";
 import { cleanupWorkspace, makePlainWorkspace } from "../helpers/mcp.js";
-import { spawnProductChild, type ProductChild } from "../helpers/spawn-product-child.js";
+import { readRuntimeIdentity, spawnProductChild, type ProductChild } from "../helpers/spawn-product-child.js";
 import { REPO_ROOT_V03 } from "../helpers/spawn-cli.js";
 
 /**
@@ -33,7 +33,7 @@ import { REPO_ROOT_V03 } from "../helpers/spawn-cli.js";
 
 interface StartedProduct {
   url: string;
-  runtime: { baseUrl: string; pid: number; stop(): Promise<void> };
+  runtime: { baseUrl: string; stop(): Promise<void> };
   restarted: boolean;
   child: ProductChild;
   capturedCliInvocations?: string[];
@@ -53,7 +53,7 @@ async function startProduct(tag: string, extra: Record<string, unknown> = {}): P
     env,
     started: {
       url: child.url,
-      runtime: { baseUrl: child.url, pid: child.pid, stop: () => child.stop() },
+      runtime: { baseUrl: child.url, stop: () => child.stop() },
       restarted: false,
       child,
       capturedCliInvocations: child.result.capturedCliInvocations,
@@ -256,18 +256,19 @@ describe("E2E — product flow acceptance (package-shaped)", () => {
 
       // Add B through the Control API product path; do NOT restart the
       // Control Runtime and do NOT restart any tunnel adapter/runtime.
-      // The runtime identity must be a real, non-empty test observable.
-      const pidBefore = started.runtime.pid;
-      expect(typeof pidBefore).toBe("number");
+      // Runtime identity is the live runtime's runtime_instance_id (from
+      // /healthz), never a launcher PID: the launcher may exit while the
+      // Control Runtime lives on.
+      const identityBefore = await readRuntimeIdentity(started.runtime.baseUrl);
       expect((await apiAddWorkspace(session, workspaceB.root, "e2e003-b")).status).toBeLessThan(300);
 
       // The very next MCP request over the SAME client connection must see
-      // both workspaces.
+      // both workspaces, served by the SAME runtime instance.
       const after = await client.callTool({ name: "workspace_list", arguments: {} });
       expect(JSON.stringify(after)).toContain("e2e003-a");
       expect(JSON.stringify(after)).toContain("e2e003-b");
-      // Same runtime process, same client connection.
-      expect(started.runtime.pid).toBe(pidBefore);
+      const identityAfter = await readRuntimeIdentity(started.runtime.baseUrl);
+      expect(identityAfter).toBe(identityBefore);
       expect(started.restarted).toBe(false);
     } finally {
       await client?.close().catch(() => {});
@@ -383,16 +384,31 @@ describe("E2E — product flow acceptance (package-shaped)", () => {
 
   it("E2E-007 reconciles the startup command into a running runtime without embedding secrets", async () => {
     const { StartupManager } = await importExpected("startupManager");
-    const manager = new StartupManager({ platformAdapter: "test" });
+    const { inMemoryStartupAdapter } = await import("../helpers/test-adapters.js");
+    const manager = new StartupManager({ adapter: inMemoryStartupAdapter() });
     const sentinel = "E2E007_SECRET_SHOULD_NEVER_PERSIST";
     await manager.enable({ executable: process.execPath, args: ["start"] });
     const definition = await manager.buildDefinition({ executable: process.execPath, args: ["start"] });
     expect(JSON.stringify(definition)).not.toContain(sentinel);
     expect(JSON.stringify(definition)).not.toMatch(/api[-_]?key|secret/i);
-    // Simulate the user-session startup: the control runtime starts and, if
-    // prerequisites exist, the desired connection is reconciled.
-    const result = await manager.simulateUserSessionStart();
-    expect(result.runtimeStarted).toBe(true);
+
+    // The user-session startup is simulated by the TEST HARNESS executing the
+    // startup definition (start the Control Runtime the way the OS startup
+    // entry would) — never by a production simulate API.
+    const env = createIsolatedProductEnv("e2e007");
+    let child: ProductChild | undefined;
+    try {
+      assertNoRealUserState(env);
+      child = await spawnProductChild(env, { entry: "start" });
+      // Control Runtime started and is healthy after the "login" start.
+      const health = await fetch(`${child.url}/healthz`);
+      expect(health.status).toBe(200);
+      // If prerequisites existed, the desired connection would be reconciled;
+      // with the test tunnel adapter stopped the runtime still starts.
+      await child.stop();
+    } finally {
+      env.cleanup();
+    }
   });
 });
 

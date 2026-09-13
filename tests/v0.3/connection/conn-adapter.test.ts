@@ -59,18 +59,54 @@ describe("CONN — tunnel adapter contracts", () => {
       path.join(FIXTURE_DIR, "runtimes-status-missing-alias.stderr.txt"),
       "utf8",
     );
+    // Gate B owner decision — Option A executable contract: the ONLY
+    // human-readable text an adapter may classify is the ONE frozen,
+    // verified missing-alias shape, and only when exit != 0 AND the command
+    // is one of the exact supported commands (status/stop). Everything else
+    // is a generic bounded external-runtime error. General text scraping
+    // stays forbidden.
+    const frozenText = missingFixture.trim();
+    expect(frozenText).toMatch(/^alias .+ is not known; run create or connect first$/);
+    // POSITIVE: the exact frozen shape on a supported command → alias-missing.
     const missingState = normalizeRuntimeStatus({
+      command: "status",
+      alias: "workspace-lens",
       exitCode: 1,
       stdout: "",
-      stderr: missingFixture,
+      stderr: `${frozenText}\n`,
     });
-    expect(missingState).toMatchObject({ state: expect.stringMatching(/missing|stopped|action-required/) });
+    expect(missingState.state).toBe("missing");
     // The product state must not leak raw provider implementation details
     // (exit codes/argv) to UI/application callers.
     expect(JSON.stringify(missingState)).not.toContain("exitCode");
 
+    // NEGATIVE 1: near-miss stderr that merely CONTAINS "not known" but does
+    // not match the frozen shape must NOT classify as alias-missing.
+    const nearMiss = normalizeRuntimeStatus({
+      command: "status",
+      alias: "workspace-lens",
+      exitCode: 1,
+      stdout: "",
+      stderr: "resource wl-example is not known; run something else first\n",
+    });
+    expect(nearMiss.state).not.toBe("missing");
+    expect(nearMiss.state).toMatch(/problem|error|unhealthy|action/);
+
+    // NEGATIVE 2: the frozen stderr text on an UNSUPPORTED command context
+    // must not classify as alias-missing either.
+    const wrongCommand = normalizeRuntimeStatus({
+      command: "cleanup",
+      alias: "workspace-lens",
+      exitCode: 1,
+      stdout: "",
+      stderr: `${frozenText}\n`,
+    });
+    expect(wrongCommand.state).not.toBe("missing");
+
     // Structured JSON status normalizes to a stable, typed state set.
     const structured = normalizeRuntimeStatus({
+      command: "status",
+      alias: "workspace-lens",
       exitCode: 0,
       stdout: JSON.stringify({ alias: "workspace-lens", status: "running", health: "healthy" }),
       stderr: "",
@@ -150,7 +186,8 @@ describe("CONN — tunnel adapter contracts", () => {
       const missing = new TunnelRuntimeAdapter({ executable: "/nonexistent/wl-stub" });
       await expect(missing.detect()).rejects.toThrow(/not.*found|missing|unavailable/i);
 
-      // Alias missing: normalized per the captured fixture semantics.
+      // Alias missing: ONLY the exact frozen Gate-B shape classifies as the
+      // stable alias-missing error (code ALIAS_MISSING, per owner Option A).
       const logPath = path.join(stubDir, "alias-missing.json");
       const scenarioPath = path.join(stubDir, "alias-missing.scenario.json");
       fs.writeFileSync(
@@ -164,7 +201,39 @@ describe("CONN — tunnel adapter contracts", () => {
         executable: stubPath,
         env: { WL_STUB_LOG: logPath, WL_STUB_SCENARIO: scenarioPath },
       });
-      await expect(adapter.status("workspace-lens")).rejects.toThrow(/not known|missing|alias/i);
+      const aliasMissingError: any = await adapter.status("workspace-lens").then(
+        () => {
+          throw new Error("expected status() to reject for a missing alias");
+        },
+        (error: any) => error,
+      );
+      expect(aliasMissingError.code).toBe("ALIAS_MISSING");
+      expect(aliasMissingError.message).toContain("workspace-lens");
+
+      // NEGATIVE: a near-miss stderr (arbitrary text containing "not known")
+      // must surface a generic bounded external-runtime error, NOT the
+      // alias-missing classification.
+      const nearMissLog = path.join(stubDir, "near-miss.json");
+      const nearMissScenario = path.join(stubDir, "near-miss.scenario.json");
+      fs.writeFileSync(
+        nearMissScenario,
+        JSON.stringify({
+          responses: [{ exitCode: 1, stderr: "resource wl-other is not known; run something else first" }],
+        }),
+      );
+      const nearMissStub = writeStubExecutable(stubDir, makeRecordingStub());
+      const nearMissAdapter = new TunnelRuntimeAdapter({
+        executable: nearMissStub,
+        env: { WL_STUB_LOG: nearMissLog, WL_STUB_SCENARIO: nearMissScenario },
+      });
+      const genericError: any = await nearMissAdapter.status("workspace-lens").then(
+        () => {
+          throw new Error("expected status() to reject for an unknown stderr shape");
+        },
+        (error: any) => error,
+      );
+      expect(genericError.code).toBeDefined();
+      expect(genericError.code).not.toBe("ALIAS_MISSING");
     } finally {
       fs.rmSync(stubDir, { recursive: true, force: true });
     }

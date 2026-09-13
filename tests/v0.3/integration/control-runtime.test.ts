@@ -5,7 +5,7 @@ import {
   createIsolatedProductEnv,
   type IsolatedProductEnv,
 } from "../helpers/isolated-env.js";
-import { spawnProductChild, type ProductChild } from "../helpers/spawn-product-child.js";
+import { readRuntimeIdentity, spawnProductChild, type ProductChild } from "../helpers/spawn-product-child.js";
 
 /**
  * L2 — Control Runtime and HTTP Integration Contracts: HTTP-001..004
@@ -58,7 +58,7 @@ describe("HTTP — Control Runtime and HTTP integration", () => {
     });
   });
 
-  it("HTTP-002 accepts reuse or explicit rejection; never two independent managers", async () => {
+  it("HTTP-002 accepts reuse or explicit rejection; a second independent manager fails the contract", async () => {
     await importExpected("controlRuntime");
     await withProductChild("http002", { entry: "control" }, async (first, env) => {
       const healthBefore = await fetch(`${first.url}/healthz`);
@@ -66,17 +66,34 @@ describe("HTTP — Control Runtime and HTTP integration", () => {
 
       // A second normal start for the SAME state root must either REUSE the
       // healthy runtime or be REJECTED explicitly — both are contract-legal;
-      // silently coexisting as an independent manager is not.
-      let outcome: "reused" | "rejected";
+      // a second runtime that successfully STARTS independently violates the
+      // contract the moment it exists, regardless of being stopped afterwards.
+      let secondChild: ProductChild | undefined;
       try {
-        const second = await spawnProductChild(env, { entry: "control" });
-        outcome = second.result.reused === true ? "reused" : "rejected";
-        await second.stop({ expectDrain: false });
-      } catch {
-        // An explicit rejection (throw on duplicate ownership) is legal.
-        outcome = "rejected";
+        secondChild = await spawnProductChild(env, { entry: "control" });
+      } catch (error) {
+        // Child explicitly failed: only a duplicate-ownership rejection is a
+        // legal outcome; any other startup failure is a genuine error.
+        const message = String((error as Error).message);
+        if (/ownership|already|running|duplicate|reuse|in use/i.test(message)) {
+          // Explicit rejection path: legal.
+        } else {
+          throw error;
+        }
       }
-      expect(["reused", "rejected"]).toContain(outcome);
+      if (secondChild) {
+        if (secondChild.result.reused !== true) {
+          // It started successfully as an independent manager — contract
+          // already violated; surface it loudly instead of marking "rejected".
+          await secondChild.stop({ expectDrain: false });
+          throw new Error(
+            "HTTP-002 FAIL: duplicate Control Runtime started independently. The second start " +
+              "neither reused the healthy runtime nor was rejected; two managers coexisted.",
+          );
+        }
+        // Reuse path: same healthy instance, still exactly one manager.
+        await secondChild.stop({ expectDrain: false });
+      }
 
       // Exactly one healthy manager remains: the first runtime still serves.
       const healthAfter = await fetch(`${first.url}/healthz`);
@@ -130,13 +147,18 @@ describe("START — canonical bootstrap (workspace-lens start)", () => {
       first = await spawnProductChild(env, { entry: "start" });
       expect(first.url).toMatch(/^http:\/\/127\.0\.0\.1/);
       expect(first.result.reused).toBe(false);
+      // Runtime identity comes from the LIVE runtime (/healthz), never from
+      // a launcher PID.
+      const identityBefore = await readRuntimeIdentity(first.url);
 
       // A second start against the healthy runtime must REUSE it (the
       // canonical bootstrap never duplicates ownership)…
       second = await spawnProductChild(env, { entry: "start" });
       expect(second.result.reused).toBe(true);
-      // …and the runtime must be the same live instance, not a second one.
-      expect(second.result.runtimeBaseUrl ?? second.url).toBe(first.result.runtimeBaseUrl ?? first.url);
+      // …and the SAME live runtime instance keeps serving — same
+      // runtime_instance_id across the second start.
+      const identityAfter = await readRuntimeIdentity(first.url);
+      expect(identityAfter).toBe(identityBefore);
 
       // Both start invocations surfaced the local WebUI URL.
       const health = await fetch(`${first.url}/healthz`);
@@ -152,15 +174,21 @@ describe("START — canonical bootstrap (workspace-lens start)", () => {
 
   it("START-001 (failure path) returns an actionable error when the local runtime cannot start", async () => {
     await importExpected("startCommand");
+    const net = await import("node:net");
     const env = createIsolatedProductEnv("start001-fail");
+    // Occupy an ephemeral port first, then make the runtime try to bind the
+    // SAME port — bind failure is deterministic on every OS/permission setup
+    // (unlike assuming a privileged port like 1 always fails).
+    const blocker = net.createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", () => resolve()));
+    const occupiedPort = (blocker.address() as import("node:net").AddressInfo).port;
     try {
       assertNoRealUserState(env);
-      // Port 1 is a privileged port: binding must fail and surface an
-      // actionable error instead of starting a broken runtime.
       await expect(
-        spawnProductChild(env, { entry: "start", extraOptions: { port: 1 } }),
-      ).rejects.toThrow(/start|runtime|port|error|failed/i);
+        spawnProductChild(env, { entry: "start", extraOptions: { port: occupiedPort } }),
+      ).rejects.toThrow(/start|runtime|port|error|failed|address/i);
     } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
       env.cleanup();
     }
   });

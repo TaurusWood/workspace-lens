@@ -80,7 +80,8 @@ describe("SECRET — secret store contracts", () => {
 describe("AUTO — login startup contracts", () => {
   it("AUTO-001 generates a startup definition with fixed command and no secret", async () => {
     const { StartupManager } = await importExpected("startupManager");
-    const manager = new StartupManager({ platformAdapter: "test" });
+    const { inMemoryStartupAdapter } = await import("../helpers/test-adapters.js");
+    const manager = new StartupManager({ adapter: inMemoryStartupAdapter() });
     const definition = await manager.buildDefinition({
       executable: "/usr/local/bin/workspace-lens",
       args: ["start"],
@@ -93,7 +94,8 @@ describe("AUTO — login startup contracts", () => {
 
   it("AUTO-002 enables/disables idempotently without duplicate entries", async () => {
     const { StartupManager } = await importExpected("startupManager");
-    const manager = new StartupManager({ platformAdapter: "test" });
+    const { inMemoryStartupAdapter } = await import("../helpers/test-adapters.js");
+    const manager = new StartupManager({ adapter: inMemoryStartupAdapter() });
     await manager.enable({ executable: "/usr/local/bin/workspace-lens", args: ["start"] });
     await manager.enable({ executable: "/usr/local/bin/workspace-lens", args: ["start"] });
     const afterDoubleEnable = await manager.status();
@@ -106,8 +108,17 @@ describe("AUTO — login startup contracts", () => {
 
   it("AUTO-003 keeps the Control Runtime startable when startup prerequisites are missing", async () => {
     const { StartupManager } = await importExpected("startupManager");
-    const manager = new StartupManager({ platformAdapter: "test", simulateMissingCredential: true });
-    const reconciliation = await manager.reconcileStartup({});
+    const { inMemoryStartupAdapter, unavailableSecretAdapter, stubTunnelAdapter } = await import(
+      "../helpers/test-adapters.js"
+    );
+    const manager = new StartupManager({ adapter: inMemoryStartupAdapter() });
+    // The missing-prerequisite scenario is produced by the TESTS injecting a
+    // deterministically unavailable secret store and a stopped tunnel — no
+    // production simulate mode exists or is needed.
+    const reconciliation = await manager.reconcileStartup({
+      secretAdapter: unavailableSecretAdapter(),
+      tunnelAdapter: stubTunnelAdapter("stopped"),
+    });
     // Startup reconciliation surfaces actionable status rather than exiting
     // the product; the Control Runtime itself is unaffected.
     expect(reconciliation).toMatchObject({
