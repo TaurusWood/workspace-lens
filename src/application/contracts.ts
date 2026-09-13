@@ -55,10 +55,33 @@ export interface ConnectionStatusResult {
   state: TunnelRuntimeState;
   /** Safe next step for the user when the state is not healthy. */
   nextAction?: string;
+  /**
+   * True when the workspace authorization config remains intact regardless
+   * of tunnel state (CONN-004: a tunnel failure is actionable, the
+   * configuration is never touched).
+   */
+  workspaceConfigurationIntact?: boolean;
 }
 
+/**
+ * Shared connection application service. Method direction follows the
+ * frozen executable contracts (`tests/v0.3/connection/conn-adapter.test.ts`,
+ * CONN-004/005): `currentStatus` is the single status entry point and
+ * `ensureConnectedForWorkspaces` converges on the ONE normal product
+ * connection — adding workspaces must never create additional connections
+ * (CONN-005). The lifecycle operations below stay on the service because
+ * the implementation plan assigns connect/start/stop/restart to it; the
+ * exact executable+argv contract lives in `TunnelRuntimeAdapter` (CONN-002).
+ */
 export interface ConnectionService {
-  status(): Promise<ConnectionStatusResult>;
+  /** Normalized current connection state across the frozen layers. */
+  currentStatus(): Promise<ConnectionStatusResult>;
+  /**
+   * Converge the one normal product connection for the given workspaces.
+   * Idempotent: repeated calls with growing workspace lists must not
+   * create additional tunnel connections.
+   */
+  ensureConnectedForWorkspaces(workspaceIds: readonly string[]): Promise<ConnectionStatusResult>;
   connect(): Promise<ConnectionStatusResult>;
   start(): Promise<ConnectionStatusResult>;
   stop(): Promise<ConnectionStatusResult>;
