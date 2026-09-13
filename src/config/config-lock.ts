@@ -1,25 +1,38 @@
 /**
  * Inter-process config mutation lock (`docs/v0.3-implementation-plan.md` §5).
  *
- * Mechanism: an atomic `mkdir` on `<configPath>.lock`. Directory creation is
- * atomic across processes, so exactly one contender owns the lock; release
- * removes the directory. A lock whose directory mtime is older than
- * `staleMs` is recovered (removed and retried), bounding the wait after a
- * crashed holder. Contention waits a bounded `timeoutMs` and then fails
- * explicitly — it never falls back to writing unlocked.
+ * Mechanism: an atomic `mkdir` on `<configPath>.lock` plus an owner-token
+ * file inside the lock directory. The token is the acquisition identity and
+ * is what makes stale recovery safe:
  *
- * The acquisition is synchronous by design: config mutations are short
- * (read + rewrite of a tiny file) and callers such as `ConfigStore.mutate`
- * must be able to complete an uncontended mutation within one synchronous
- * call (the multi-process CFG-004 contract depends on it). The contended
- * path busy-waits at most `timeoutMs` (default 500ms) before failing.
+ * - release() removes ONLY its own token file, then the directory ONLY if
+ *   it is empty. A stale holder that resumes after a successor took over
+ *   therefore cannot delete the successor's lock — it finds no token of its
+ *   own and no empty directory to remove.
+ * - stale recovery moves the abandoned directory aside with one atomic
+ *   rename before creating a new lock, so two concurrent recovery attempts
+ *   cannot both win, and the recovery itself is bounded by `staleMs`.
+ *
+ * Contention waits belong to the caller: `acquireConfigLock` makes a single
+ * acquisition attempt (plus immediate stale recovery) and fails with
+ * `ConfigLockBusyError` while a live owner holds the lock. The application
+ * service retries without blocking the event loop; `timeoutMs > 0` opts
+ * into a synchronous busy-wait and exists only for short-lived low-level
+ * uses (tests), never for the product mutation path.
+ *
+ * A crash between `mkdir` and the token write leaves an owner-less
+ * directory; it holds nothing back and is recovered after `staleMs`.
  */
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ConfigError } from "./config-schema.js";
 
 export interface ConfigLockOptions {
-  /** Bounded contention wait in ms; <= 0 makes the first attempt final. Default 500. */
+  /**
+   * Bounded synchronous contention wait in ms; 0 (the default) makes the
+   * first failed attempt final.
+   */
   timeoutMs?: number;
   /** Age in ms after which an unreleased lock is recovered as stale. Default 10000. */
   staleMs?: number;
@@ -29,16 +42,23 @@ export interface ConfigLockHandle {
   release(): void;
 }
 
-const DEFAULT_TIMEOUT_MS = 500;
+/** The lock is currently held by a live owner; safe to retry against. */
+export class ConfigLockBusyError extends ConfigError {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigLockBusyError";
+  }
+}
+
 const DEFAULT_STALE_MS = 10000;
 
 export function configLockPath(configPath: string): string {
   return `${configPath}.lock`;
 }
 
-/** Acquire the config lock or fail explicitly with a stable config error. */
+/** Acquire the config lock or fail explicitly; never writes unlocked. */
 export function acquireConfigLock(configPath: string, options: ConfigLockOptions = {}): ConfigLockHandle {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? 0;
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
   const lockDir = configLockPath(configPath);
   const deadline = Date.now() + timeoutMs;
@@ -48,35 +68,78 @@ export function acquireConfigLock(configPath: string, options: ConfigLockOptions
   // directories — never the config file itself.
   fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
 
+  const token = `${process.pid}-${randomUUID()}`;
   for (;;) {
-    try {
-      fs.mkdirSync(lockDir);
-      return { release(): void { fs.rmSync(lockDir, { recursive: true, force: true }); } };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw new ConfigError(
-          `Cannot create the config lock ${lockDir}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+    if (tryAcquire(lockDir, token)) {
+      return createHandle(lockDir, token);
     }
 
     // The lock is held. Recover it only after a bounded stale age; a live
-    // holder refreshes nothing but holds for far less than `staleMs`.
+    // holder holds for far less than `staleMs`.
     if (isStale(lockDir, staleMs)) {
-      try {
-        fs.rmSync(lockDir, { recursive: true, force: true });
-      } catch {
-        // Another contender recovered it first; retry the mkdir below.
-      }
+      recoverStale(lockDir, token);
       continue;
     }
 
     if (Date.now() >= deadline) {
-      throw new ConfigError(
-        `Could not acquire the config lock for ${configPath}: the lock is held by another process ` +
-          `(timeout after ${timeoutMs}ms). No changes were written.`,
+      throw new ConfigLockBusyError(
+        `The config lock for ${configPath} is held by another process ` +
+          `(not stale after ${timeoutMs}ms). No changes were written.`,
       );
     }
+  }
+}
+
+function tryAcquire(lockDir: string, token: string): boolean {
+  try {
+    fs.mkdirSync(lockDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return false;
+    }
+    throw new ConfigError(
+      `Cannot create the config lock ${lockDir}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    fs.writeFileSync(path.join(lockDir, ownerFileName(token)), token, { mode: 0o600 });
+    return true;
+  } catch (error) {
+    // Never leave an unusable lock behind; stale recovery is the backstop.
+    try {
+      fs.rmSync(lockDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+    throw new ConfigError(
+      `Cannot write the config lock owner token in ${lockDir}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * Move an abandoned lock directory aside atomically, then delete it. If
+ * another actor recovered it first, the rename fails with ENOENT and the
+ * caller simply retries the acquisition against whatever is there now.
+ */
+function recoverStale(lockDir: string, token: string): void {
+  const stalePath = `${lockDir}.stale-${token}`;
+  try {
+    fs.renameSync(lockDir, stalePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    throw new ConfigError(
+      `Cannot recover the stale config lock ${lockDir}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    fs.rmSync(stalePath, { recursive: true, force: true });
+  } catch {
+    // Best effort; the uniquely-named leftover is inert.
   }
 }
 
@@ -87,4 +150,39 @@ function isStale(lockDir: string, staleMs: number): boolean {
     // Vanished between mkdir and stat: treat as free and retry the mkdir.
     return false;
   }
+}
+
+/**
+ * The owner file NAME carries the acquisition token, which is what makes
+ * release structurally safe: `unlink` targets a path only our acquisition
+ * ever created, so it cannot delete a successor's owner file no matter how
+ * the directory's contents changed while we were suspended. The directory
+ * itself is removed only when empty — an empty lock directory holds no
+ * owner file, so it proves no live ownership.
+ */
+function ownerFileName(token: string): string {
+  return `owner-${token}`;
+}
+
+function createHandle(lockDir: string, token: string): ConfigLockHandle {
+  const ownerFile = path.join(lockDir, ownerFileName(token));
+  return {
+    release(): void {
+      // Remove only OUR owner file (the name embeds our token), then the
+      // directory only when empty. If a successor took over (stale
+      // recovery), its owner file has a different name, the directory is
+      // non-empty, and nothing of theirs is deleted.
+      try {
+        fs.unlinkSync(ownerFile);
+      } catch {
+        // Already gone (taken over or double release).
+      }
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {
+        // ENOENT: taken over or already released. ENOTEMPTY: a successor
+        // owns the directory now. Never remove someone else's lock.
+      }
+    },
+  };
 }

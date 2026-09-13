@@ -27,6 +27,7 @@ import {
   sanitizeWorkspaceIdBase,
   type ConfigMutationSyncPoints,
 } from "../config/config-store.js";
+import { ConfigLockBusyError } from "../config/config-lock.js";
 
 export interface AddWorkspaceInput {
   root: string;
@@ -50,6 +51,11 @@ export interface WorkspaceAdminServiceDependencies {
    * mutation, invoked in-lock after the latest config is loaded.
    */
   syncPoints?: ConfigMutationSyncPoints;
+  /**
+   * Total budget for waiting on a lock held by another live process. The
+   * wait yields the event loop (sleep/retry), it never spins. Default 2000.
+   */
+  lockTimeoutMs?: number;
 }
 
 /** Product view of one authorized workspace, including validation state. */
@@ -74,12 +80,17 @@ export interface IdentityValidation {
 }
 
 export class WorkspaceAdminService {
+  private static readonly DEFAULT_LOCK_TIMEOUT_MS = 2000;
+  private static readonly LOCK_RETRY_DELAY_MS = 10;
+
   private readonly configStore: ConfigStore;
   private readonly syncPoints: ConfigMutationSyncPoints | undefined;
+  private readonly lockTimeoutMs: number;
 
   constructor(dependencies: WorkspaceAdminServiceDependencies) {
     this.configStore = dependencies.configStore;
     this.syncPoints = dependencies.syncPoints;
+    this.lockTimeoutMs = dependencies.lockTimeoutMs ?? WorkspaceAdminService.DEFAULT_LOCK_TIMEOUT_MS;
   }
 
   /** All authorized workspaces with their current validation state. */
@@ -97,11 +108,13 @@ export class WorkspaceAdminService {
    * path base when no name is given).
    */
   async add(input: AddWorkspaceInput): Promise<WorkspaceConfig> {
-    return this.configStore.add(input.root, {
-      name: input.name,
-      id: input.id,
-      idBasis: input.idBasis ?? "name",
-    });
+    return this.withLockRetry(() =>
+      this.configStore.add(input.root, {
+        name: input.name,
+        id: input.id,
+        idBasis: input.idBasis ?? "name",
+      }),
+    );
   }
 
   /** Rename the display name; identity, root, and enabled state are untouched. */
@@ -147,7 +160,7 @@ export class WorkspaceAdminService {
 
   /** Remove authorization by workspace_id (or unambiguous name). Files are untouched. */
   async remove(idOrName: string): Promise<WorkspaceConfig> {
-    return this.configStore.remove(idOrName);
+    return this.withLockRetry(() => this.configStore.remove(idOrName));
   }
 
   /** Validate a root candidate without authorizing it. */
@@ -193,9 +206,37 @@ export class WorkspaceAdminService {
 
   private mutateWorkspace<T>(
     mutation: (config: WorkspaceLensConfig) => { next: WorkspaceLensConfig; result: T },
-  ): T {
-    return this.configStore.mutate(mutation, { syncPoints: this.syncPoints });
+  ): Promise<T> {
+    return this.withLockRetry(() =>
+      this.configStore.mutate(mutation, { syncPoints: this.syncPoints }),
+    );
   }
+
+  /**
+   * Run one config mutation, waiting out a lock held by another live
+   * process. The wait yields the event loop (sleep/retry) instead of
+   * spinning, so a concurrent CLI/WebUI mutation delays — but never blocks
+   * — the caller, and a long-held lock fails explicitly after the budget.
+   */
+  private withLockRetry<T>(operation: () => T): Promise<T> {
+    const deadline = Date.now() + this.lockTimeoutMs;
+    const attempt = async (): Promise<T> => {
+      try {
+        return operation();
+      } catch (error) {
+        if (error instanceof ConfigLockBusyError && Date.now() < deadline) {
+          await sleep(WorkspaceAdminService.LOCK_RETRY_DELAY_MS);
+          return attempt();
+        }
+        throw error;
+      }
+    };
+    return attempt();
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Whether the root is currently an accessible directory (no parent fallback). */

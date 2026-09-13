@@ -3,7 +3,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigError, emptyConfig } from "../../../src/config/config-schema.js";
 import { ConfigStore } from "../../../src/config/config-store.js";
-import { acquireConfigLock, configLockPath } from "../../../src/config/config-lock.js";
+import {
+  acquireConfigLock,
+  ConfigLockBusyError,
+  configLockPath,
+} from "../../../src/config/config-lock.js";
 import { WorkspaceAdminService } from "../../../src/application/workspace-admin-service.js";
 import { makeTempRoot, writeTree } from "../../helpers/fixtures.js";
 
@@ -133,7 +137,9 @@ describe("CFG unit — config lock", () => {
     try {
       const holder = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 });
       // Fresh lock: not recoverable.
-      expect(() => acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 })).toThrow(/lock/i);
+      expect(() => acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 })).toThrow(
+        ConfigLockBusyError,
+      );
       // Backdate beyond the stale window: bounded recovery takes over.
       const past = new Date(Date.now() - 60_000);
       fs.utimesSync(configLockPath(configPath), past, past);
@@ -141,6 +147,81 @@ describe("CFG unit — config lock", () => {
       stolen.release();
       holder.release();
     } finally {
+      fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps successor ownership when a stale holder resumes after a takeover", () => {
+    const configPath = newConfigFile();
+    try {
+      // Holder A acquires, then goes away for longer than the stale window.
+      const holderA = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 });
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(configLockPath(configPath), past, past);
+      // B recovers the abandoned lock and is now the rightful owner.
+      const holderB = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 });
+
+      // A resumes and releases: it must NOT delete B's lock.
+      holderA.release();
+      expect(fs.existsSync(configLockPath(configPath))).toBe(true);
+
+      // While B still owns the lock, C must not acquire it.
+      expect(() => acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 })).toThrow(
+        ConfigLockBusyError,
+      );
+
+      // After B releases normally, C acquires cleanly.
+      holderB.release();
+      const holderC = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 });
+      holderC.release();
+      expect(fs.existsSync(configLockPath(configPath))).toBe(false);
+    } finally {
+      fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("CFG unit — yielding lock waits (no event-loop spinning)", () => {
+  it("fails explicitly after the yielding budget when a live holder keeps the lock", async () => {
+    const configPath = newConfigFile();
+    const root = newWorkspace("yield-busy");
+    try {
+      const holder = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 });
+      try {
+        const service = new WorkspaceAdminService({
+          configStore: new ConfigStore(configPath),
+          lockTimeoutMs: 150,
+        });
+        const startedAt = Date.now();
+        await expect(service.add({ root, id: "yield-busy-ws" })).rejects.toThrow(
+          /lock|timeout/i,
+        );
+        // The budget was actually observed (yielding wait, not instant fail).
+        expect(Date.now() - startedAt).toBeGreaterThanOrEqual(140);
+        // Nothing was written while the lock was held by someone else.
+        expect(fs.existsSync(configPath)).toBe(false);
+      } finally {
+        holder.release();
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
+    }
+  });
+
+  it("acquires the lock as soon as the current holder releases", async () => {
+    const configPath = newConfigFile();
+    const root = newWorkspace("yield-success");
+    try {
+      const holder = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 });
+      // The holder releases shortly after; the service's yielding wait must
+      // then complete the mutation instead of failing.
+      setTimeout(() => holder.release(), 30);
+      const service = new WorkspaceAdminService({ configStore: new ConfigStore(configPath) });
+      const added = await service.add({ root, id: "yield-success-ws" });
+      expect(added.workspace_id).toBe("yield-success-ws");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
     }
   });
