@@ -134,6 +134,35 @@ describe("HTTP — Control Runtime and HTTP integration", () => {
       expect(text).toMatch(/unknown tool|not found|method/i);
     });
   });
+
+  it("runtime_instance_id distinguishes runtime INSTANCES, not the product", async () => {
+    await importExpected("controlRuntime");
+    const env = createIsolatedProductEnv("identity");
+    let first: ProductChild | undefined;
+    let second: ProductChild | undefined;
+    try {
+      assertNoRealUserState(env);
+      // Start runtime instance A and read its identity.
+      first = await spawnProductChild(env, { entry: "control" });
+      const idA = await readRuntimeIdentity(first.url);
+      expect(typeof idA).toBe("string");
+      expect(idA.length).toBeGreaterThan(0);
+
+      // Stop A, then start a FRESH runtime B on the same state root.
+      await first.stop();
+      second = await spawnProductChild(env, { entry: "control" });
+      const idB = await readRuntimeIdentity(second.url);
+
+      // Instance identity, not product identity: a constant string (e.g.
+      // "workspace-lens") or any id that survives a genuine restart cannot
+      // prove "no restart" in E2E-003/START-001.
+      expect(idB).not.toBe(idA);
+    } finally {
+      await second?.stop();
+      await first?.stop();
+      env.cleanup();
+    }
+  });
 });
 
 describe("START — canonical bootstrap (workspace-lens start)", () => {
