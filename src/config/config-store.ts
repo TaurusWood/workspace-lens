@@ -164,7 +164,11 @@ export class ConfigStore {
    * directory; it is canonicalized before saving. Duplicate and overlapping
    * roots are rejected.
    */
-  add(rootPath: string, options: AddWorkspaceOptions = {}): WorkspaceConfig {
+  add(
+    rootPath: string,
+    options: AddWorkspaceOptions = {},
+    mutationOptions: ConfigMutationOptions = {},
+  ): WorkspaceConfig {
     const canonical = this.canonicalizeExistingRoot(rootPath);
     return this.mutate((config) => {
       for (const existing of config.workspaces) {
@@ -195,11 +199,11 @@ export class ConfigStore {
       };
       config.workspaces.push(workspace);
       return { next: config, result: workspace };
-    });
+    }, mutationOptions);
   }
 
   /** Remove by workspace_id, or by exact name when the name is unambiguous. */
-  remove(idOrName: string): WorkspaceConfig {
+  remove(idOrName: string, mutationOptions: ConfigMutationOptions = {}): WorkspaceConfig {
     return this.mutate((config) => {
       let index = config.workspaces.findIndex((ws) => ws.workspace_id === idOrName);
       if (index === -1) {
@@ -217,7 +221,7 @@ export class ConfigStore {
       }
       const [removed] = config.workspaces.splice(index, 1);
       return { next: config, result: removed! };
-    });
+    }, mutationOptions);
   }
 
   private canonicalizeExistingRoot(rootPath: string): string {

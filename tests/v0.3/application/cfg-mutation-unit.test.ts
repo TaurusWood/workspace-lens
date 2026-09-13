@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ConfigError, emptyConfig } from "../../../src/config/config-schema.js";
 import { ConfigStore } from "../../../src/config/config-store.js";
@@ -132,54 +134,201 @@ describe("CFG unit — config lock", () => {
     }
   });
 
-  it("recovers a stale lock within a bounded age and never a fresh one", () => {
+  it("never steals a live-but-old lock merely because its mtime aged past the window", async () => {
     const configPath = newConfigFile();
     try {
-      const holder = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 });
-      // Fresh lock: not recoverable.
-      expect(() => acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 })).toThrow(
-        ConfigLockBusyError,
+      // A child process acquires the lock and artificially ages its lock
+      // directory far beyond any stale window while staying ALIVE.
+      const readyFile = path.join(makeTempRoot("wl-v03-cfg-ready-"), "ready");
+      const child = spawn(
+        process.execPath,
+        ["-e", LIVE_OLD_HOLDER_SCRIPT(configPath, readyFile)],
+        { stdio: "ignore" },
       );
-      // Backdate beyond the stale window: bounded recovery takes over.
-      const past = new Date(Date.now() - 60_000);
-      fs.utimesSync(configLockPath(configPath), past, past);
-      const stolen = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 });
-      stolen.release();
-      holder.release();
+      const childDone = exitOf(child);
+      try {
+        await waitForFile(readyFile, 10_000);
+        // The lock mtime is an hour old, but the recorded owner process is
+        // alive: recovery is FORBIDDEN regardless of staleness settings.
+        expect(() => acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 1 })).toThrow(
+          ConfigLockBusyError,
+        );
+      } finally {
+        await childDone;
+      }
+      // After the live owner releases, acquisition succeeds normally.
+      const next = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 1 });
+      next.release();
     } finally {
       fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
     }
   });
 
-  it("keeps successor ownership when a stale holder resumes after a takeover", () => {
+  it("recovers the lock once the recorded owner process is dead", async () => {
     const configPath = newConfigFile();
     try {
-      // Holder A acquires, then goes away for longer than the stale window.
-      const holderA = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 });
-      const past = new Date(Date.now() - 60_000);
-      fs.utimesSync(configLockPath(configPath), past, past);
-      // B recovers the abandoned lock and is now the rightful owner.
-      const holderB = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 50 });
+      // A child process acquires the lock and CRASHES without releasing.
+      const readyFile = path.join(makeTempRoot("wl-v03-cfg-ready-"), "ready");
+      const child = spawn(
+        process.execPath,
+        ["-e", CRASHED_HOLDER_SCRIPT(configPath, readyFile)],
+        { stdio: "ignore" },
+      );
+      const childDone = exitOf(child);
+      await waitForFile(readyFile, 10_000);
+      await childDone; // the owner pid is dead (and reaped) from here on
 
-      // A resumes and releases: it must NOT delete B's lock.
-      holderA.release();
+      // Recovery now succeeds without any mtime manipulation.
+      const recovered = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 });
+      recovered.release();
+    } finally {
+      fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
+    }
+  });
+
+  it("release removes only its own owner file and never a directory it no longer owns", () => {
+    const configPath = newConfigFile();
+    try {
+      const handle = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 });
+      // Simulate any foreign owner artifact inside the lock directory.
+      const foreignFile = path.join(configLockPath(configPath), "owner-foreign-token");
+      fs.writeFileSync(foreignFile, "foreign", { mode: 0o600 });
+
+      handle.release();
+
+      // The foreign owner file survives; the directory stays because it is
+      // not empty (release cannot delete what it does not own).
+      expect(fs.existsSync(foreignFile)).toBe(true);
       expect(fs.existsSync(configLockPath(configPath))).toBe(true);
 
-      // While B still owns the lock, C must not acquire it.
-      expect(() => acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 })).toThrow(
-        ConfigLockBusyError,
-      );
-
-      // After B releases normally, C acquires cleanly.
-      holderB.release();
-      const holderC = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 });
-      holderC.release();
+      // Cleaning the foreign artifact leaves an EMPTY lock directory: the
+      // ownership protocol treats it as an owner-less remnant that ages out
+      // (simulated here by backdating), after which acquisition succeeds.
+      fs.rmSync(foreignFile);
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(configLockPath(configPath), past, past);
+      const next = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 1000 });
+      next.release();
       expect(fs.existsSync(configLockPath(configPath))).toBe(false);
     } finally {
       fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
     }
   });
+
+  it("keeps both accepted mutations when a slow holder commits while another waits", async () => {
+    const configPath = newConfigFile();
+    const rootSlow = newWorkspace("slow");
+    const rootWaiter = newWorkspace("waiter");
+    try {
+      // The slow holder acquires the lock, stays alive for a while, and
+      // commits from its (older) view while holding the lock. A waiting
+      // mutation must NOT be able to interleave — after the holder
+      // releases, the waiter re-enters and commits on the latest config.
+      const readyFile = path.join(makeTempRoot("wl-v03-cfg-ready-"), "ready");
+      const child = spawn(
+        process.execPath,
+        ["-e", SLOW_HOLDER_SCRIPT(configPath, readyFile, rootSlow, "slow-a")],
+        { stdio: "ignore" },
+      );
+      const childDone = exitOf(child);
+      await waitForFile(readyFile, 10_000);
+
+      const service = new WorkspaceAdminService({ configStore: new ConfigStore(configPath) });
+      const waiter = await service.add({ root: rootWaiter, id: "waiter-b" });
+
+      await childDone; // the slow holder committed slow-a and released
+
+      // Business-level no-lost-update: BOTH accepted mutations exist,
+      // exactly once, regardless of who held the lock longer.
+      const config = new ConfigStore(configPath).load();
+      const ids = config.workspaces.map((ws) => ws.workspace_id);
+      expect(ids).toContain("slow-a");
+      expect(ids).toContain(waiter.workspace_id);
+      expect(ids.filter((id) => id === "slow-a")).toHaveLength(1);
+      expect(ids.filter((id) => id === "waiter-b")).toHaveLength(1);
+    } finally {
+      fs.rmSync(rootSlow, { recursive: true, force: true });
+      fs.rmSync(rootWaiter, { recursive: true, force: true });
+      fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
+    }
+  });
 });
+
+const DIST_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../dist");
+
+/** Child holding the lock with an artificially aged (but ALIVE) ownership. */
+const LIVE_OLD_HOLDER_SCRIPT = (configPath: string, readyFile: string): string => `
+import fs from "node:fs";
+const { acquireConfigLock, configLockPath } = await import(${JSON.stringify(path.join(DIST_ROOT, "config/config-lock.js"))});
+const handle = acquireConfigLock(${JSON.stringify(configPath)}, { timeoutMs: 0, staleMs: 60000 });
+const past = new Date(Date.now() - 3600_000);
+fs.utimesSync(configLockPath(${JSON.stringify(configPath)}), past, past);
+fs.writeFileSync(${JSON.stringify(readyFile)}, String(process.pid));
+setTimeout(() => { handle.release(); process.exit(0); }, 300);
+`;
+
+/** Child acquiring the lock and crashing without releasing. */
+const CRASHED_HOLDER_SCRIPT = (configPath: string, readyFile: string): string => `
+import fs from "node:fs";
+const { acquireConfigLock } = await import(${JSON.stringify(path.join(DIST_ROOT, "config/config-lock.js"))});
+acquireConfigLock(${JSON.stringify(configPath)}, { timeoutMs: 0 });
+fs.writeFileSync(${JSON.stringify(readyFile)}, String(process.pid));
+process.exit(0);
+`;
+
+/**
+ * Child committing through the REAL mutation path while holding the lock
+ * longer than a waiter's first attempts: the afterLoad seam (in-lock,
+ * after load, before apply) parks the mutation, so it commits from its
+ * older in-lock view exactly like a slow holder would.
+ */
+const SLOW_HOLDER_SCRIPT = (configPath: string, readyFile: string, root: string, id: string): string => `
+import fs from "node:fs";
+const { ConfigStore } = await import(${JSON.stringify(path.join(DIST_ROOT, "config/config-store.js"))});
+const { WorkspaceAdminService } = await import(${JSON.stringify(path.join(DIST_ROOT, "application/workspace-admin-service.js"))});
+const service = new WorkspaceAdminService({
+  configStore: new ConfigStore(${JSON.stringify(configPath)}),
+  syncPoints: {
+    afterLoad: () => {
+      fs.writeFileSync(${JSON.stringify(readyFile)}, String(process.pid));
+      const end = Date.now() + 300;
+      while (Date.now() < end) { /* hold the lock from the in-lock view */ }
+    },
+  },
+});
+service.add({ root: ${JSON.stringify(root)}, id: ${JSON.stringify(id)} })
+  .then(() => process.exit(0), (error) => { console.error(String(error && error.message)); process.exit(1); });
+`;
+
+function waitForFile(file: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const poll = (): void => {
+      if (fs.existsSync(file)) {
+        resolve();
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error(`Timed out waiting for ${file}`));
+        return;
+      }
+      setTimeout(poll, 20);
+    };
+    poll();
+  });
+}
+
+/**
+ * Exit promise created IMMEDIATELY after spawn: a child that exits before
+ * the test starts awaiting would otherwise emit its exit event without a
+ * listener and the await would hang forever.
+ */
+function exitOf(child: ChildProcess): Promise<void> {
+  return new Promise((resolve, reject) => {
+    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`child exit ${code}`))));
+    child.on("error", reject);
+  });
+}
 
 describe("CFG unit — yielding lock waits (no event-loop spinning)", () => {
   it("fails explicitly after the yielding budget when a live holder keeps the lock", async () => {

@@ -1,27 +1,40 @@
 /**
  * Inter-process config mutation lock (`docs/v0.3-implementation-plan.md` §5).
  *
- * Mechanism: an atomic `mkdir` on `<configPath>.lock` plus an owner-token
- * file inside the lock directory. The token is the acquisition identity and
- * is what makes stale recovery safe:
+ * Ownership protocol:
  *
- * - release() removes ONLY its own token file, then the directory ONLY if
- *   it is empty. A stale holder that resumes after a successor took over
- *   therefore cannot delete the successor's lock — it finds no token of its
- *   own and no empty directory to remove.
- * - stale recovery moves the abandoned directory aside with one atomic
- *   rename before creating a new lock, so two concurrent recovery attempts
- *   cannot both win, and the recovery itself is bounded by `staleMs`.
+ * - Ownership is one atomic `mkdir` of `<configPath>.lock` plus an
+ *   `owner-<token>` file inside it whose NAME carries the acquisition token
+ *   and whose content records `{ token, pid }`.
+ * - release() unlinks ONLY the file named with our own token and then
+ *   removes the directory ONLY if it is empty (empty = no owner file = no
+ *   live ownership). Structurally it can never delete another holder's
+ *   lock, whatever happened meanwhile.
+ * - Stale recovery is bound to OWNER DEATH, not to lock age: a directory
+ *   whose recorded owner process is still alive is never taken over, no
+ *   matter how old its mtime is. A suspended or sleeping holder therefore
+ *   keeps exclusive ownership and its in-flight mutation cannot lose a
+ *   successor's accepted change, because no successor can exist. Only a
+ *   DEAD owner's owner-file is unlinked, and the unlink target name is the
+ *   observed dead token, so concurrent recovery attempts race on atomic
+ *   mkdir afterwards instead of stealing from each other.
+ * - A lock directory WITHOUT any owner file holds no proof of ownership
+ *   (initialization window or crash remnant), and neither does one whose
+ *   owner file is unreadable. Both are removed only once the directory is
+ *   older than `staleMs` — by then a live writer's microsecond-scale write
+ *   has long completed, so the remnant provably belongs to a dead writer.
+ *   Removal itself is conditional (rmdir on empty / unlink by exact name),
+ *   so it can never destroy ownership that appeared meanwhile.
  *
- * Contention waits belong to the caller: `acquireConfigLock` makes a single
- * acquisition attempt (plus immediate stale recovery) and fails with
- * `ConfigLockBusyError` while a live owner holds the lock. The application
- * service retries without blocking the event loop; `timeoutMs > 0` opts
- * into a synchronous busy-wait and exists only for short-lived low-level
- * uses (tests), never for the product mutation path.
+ * PID reuse is handled fail-safe: a recycled pid makes a dead owner look
+ * alive, so recovery is skipped and callers see an explicit lock timeout —
+ * never a wrong takeover.
  *
- * A crash between `mkdir` and the token write leaves an owner-less
- * directory; it holds nothing back and is recovered after `staleMs`.
+ * Contention waits belong to the caller: acquisition is a single attempt
+ * (`timeoutMs <= 0`, the default) and fails with `ConfigLockBusyError`
+ * while a live owner holds the lock. The application service retries by
+ * yielding; `timeoutMs > 0` opts into a synchronous busy-wait and exists
+ * only for short-lived low-level uses (tests), never the product path.
  */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -34,7 +47,12 @@ export interface ConfigLockOptions {
    * first failed attempt final.
    */
   timeoutMs?: number;
-  /** Age in ms after which an unreleased lock is recovered as stale. Default 10000. */
+  /**
+   * Age in ms after which an owner-LESS (no readable owner file) lock
+   * directory counts as a crash remnant and may be removed. Recovery of a
+   * directory WITH an owner file is driven by owner-process death instead.
+   * Default 10000. Kept for API compatibility with previous releases.
+   */
   staleMs?: number;
 }
 
@@ -51,6 +69,7 @@ export class ConfigLockBusyError extends ConfigError {
 }
 
 const DEFAULT_STALE_MS = 10000;
+const OWNER_PREFIX = "owner-";
 
 export function configLockPath(configPath: string): string {
   return `${configPath}.lock`;
@@ -74,17 +93,16 @@ export function acquireConfigLock(configPath: string, options: ConfigLockOptions
       return createHandle(lockDir, token);
     }
 
-    // The lock is held. Recover it only after a bounded stale age; a live
-    // holder holds for far less than `staleMs`.
-    if (isStale(lockDir, staleMs)) {
-      recoverStale(lockDir, token);
+    // The lock directory exists. Reclaim it only when ownership provably
+    // ended (dead owner, aged-out remnant); otherwise it is held.
+    if (reclaimIfRecoverable(lockDir, staleMs)) {
       continue;
     }
 
     if (Date.now() >= deadline) {
       throw new ConfigLockBusyError(
         `The config lock for ${configPath} is held by another process ` +
-          `(not stale after ${timeoutMs}ms). No changes were written.`,
+          `(its recorded owner process is alive; waited ${timeoutMs}ms). No changes were written.`,
       );
     }
   }
@@ -102,10 +120,15 @@ function tryAcquire(lockDir: string, token: string): boolean {
     );
   }
   try {
-    fs.writeFileSync(path.join(lockDir, ownerFileName(token)), token, { mode: 0o600 });
+    fs.writeFileSync(
+      path.join(lockDir, ownerFileName(token)),
+      JSON.stringify({ token, pid: process.pid }),
+      { mode: 0o600 },
+    );
     return true;
   } catch (error) {
-    // Never leave an unusable lock behind; stale recovery is the backstop.
+    // Never leave an unusable lock behind; owner-less recovery is the
+    // backstop.
     try {
       fs.rmSync(lockDir, { recursive: true, force: true });
     } catch {
@@ -118,37 +141,116 @@ function tryAcquire(lockDir: string, token: string): boolean {
   }
 }
 
-/**
- * Move an abandoned lock directory aside atomically, then delete it. If
- * another actor recovered it first, the rename fails with ENOENT and the
- * caller simply retries the acquisition against whatever is there now.
- */
-function recoverStale(lockDir: string, token: string): void {
-  const stalePath = `${lockDir}.stale-${token}`;
-  try {
-    fs.renameSync(lockDir, stalePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return;
-    }
-    throw new ConfigError(
-      `Cannot recover the stale config lock ${lockDir}: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  try {
-    fs.rmSync(stalePath, { recursive: true, force: true });
-  } catch {
-    // Best effort; the uniquely-named leftover is inert.
-  }
+interface OwnerFile {
+  file: string;
+  /** Parsed owner pid; undefined when the file is unreadable/corrupt. */
+  pid: number | undefined;
 }
 
-function isStale(lockDir: string, staleMs: number): boolean {
+/**
+ * Every deletion in the recovery protocol is conditional, so it can never
+ * destroy live ownership:
+ *
+ * - an owner file whose recorded process is DEAD is unlinked by its exact
+ *   name — a dead process cannot resurrect or rewrite it, and a successor's
+ *   file has a different token in its name;
+ * - a CORRUPT (unreadable) owner file is only removed once the directory is
+ *   older than `staleMs`: by then a live writer's microsecond-scale write
+ *   has long completed (a complete file parses and is judged by pid), so an
+ *   aged corrupt file is provably a dead writer's remnant;
+ * - an EMPTY directory holds no owner file, hence no proof of ownership;
+ *   it is removed with rmdir, which fails atomically if any owner file
+ *   appeared meanwhile.
+ *
+ * A live owner is never taken over, no matter how old its lock is: PID reuse
+ * makes dead owners look alive instead (explicit timeout, never a wrong
+ * takeover).
+ */
+function reclaimIfRecoverable(lockDir: string, staleMs: number): boolean {
+  let files: string[];
+  try {
+    files = fs.readdirSync(lockDir).filter((name) => name.startsWith(OWNER_PREFIX));
+  } catch {
+    return false; // vanished; retry the acquisition
+  }
+
+  if (files.length === 0) {
+    if (!isOldEnough(lockDir, staleMs)) {
+      return false; // likely an initialization window; do not touch it
+    }
+    try {
+      fs.rmdirSync(lockDir);
+    } catch {
+      // ENOTEMPTY: an owner file appeared (they keep the lock); ENOENT:
+      // gone. Either way, retry the acquisition.
+    }
+    return true;
+  }
+
+  const deadOwnerFiles: string[] = [];
+  let corruptFiles: string[] = [];
+  for (const file of files) {
+    let pid: unknown;
+    try {
+      pid = (JSON.parse(fs.readFileSync(path.join(lockDir, file), "utf8")) as { pid?: unknown }).pid;
+    } catch {
+      corruptFiles.push(file);
+      continue;
+    }
+    if (typeof pid === "number" && processAlive(pid)) {
+      return false; // a live owner holds this lock: never take over
+    }
+    if (typeof pid === "number") {
+      deadOwnerFiles.push(file);
+    } else {
+      corruptFiles.push(file);
+    }
+  }
+  if (deadOwnerFiles.length === 0 && corruptFiles.length === 0) {
+    return false; // unreachable in practice; treat as held
+  }
+  for (const file of deadOwnerFiles) {
+    try {
+      fs.unlinkSync(path.join(lockDir, file));
+    } catch {
+      // Another recovery actor got there first.
+    }
+  }
+  if (corruptFiles.length > 0 && isOldEnough(lockDir, staleMs)) {
+    for (const file of corruptFiles) {
+      try {
+        fs.unlinkSync(path.join(lockDir, file));
+      } catch {
+        // Gone already.
+      }
+    }
+  }
+  try {
+    fs.rmdirSync(lockDir);
+  } catch {
+    // ENOTEMPTY: something owns it now; ENOENT: gone. Retry acquisition.
+  }
+  return true;
+}
+
+function isOldEnough(lockDir: string, staleMs: number): boolean {
   try {
     return Date.now() - fs.statSync(lockDir).mtimeMs > staleMs;
   } catch {
-    // Vanished between mkdir and stat: treat as free and retry the mkdir.
     return false;
+  }
+}
+
+/** EPERM means the process exists but is not ours: treat it as alive. */
+function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
@@ -161,7 +263,7 @@ function isStale(lockDir: string, staleMs: number): boolean {
  * owner file, so it proves no live ownership.
  */
 function ownerFileName(token: string): string {
-  return `owner-${token}`;
+  return `${OWNER_PREFIX}${token}`;
 }
 
 function createHandle(lockDir: string, token: string): ConfigLockHandle {
@@ -169,19 +271,19 @@ function createHandle(lockDir: string, token: string): ConfigLockHandle {
   return {
     release(): void {
       // Remove only OUR owner file (the name embeds our token), then the
-      // directory only when empty. If a successor took over (stale
-      // recovery), its owner file has a different name, the directory is
-      // non-empty, and nothing of theirs is deleted.
+      // directory only when empty. If a successor owns the directory, its
+      // owner file has a different name, the directory is non-empty, and
+      // nothing of theirs is deleted.
       try {
         fs.unlinkSync(ownerFile);
       } catch {
-        // Already gone (taken over or double release).
+        // Already gone (double release).
       }
       try {
         fs.rmdirSync(lockDir);
       } catch {
-        // ENOENT: taken over or already released. ENOTEMPTY: a successor
-        // owns the directory now. Never remove someone else's lock.
+        // ENOENT: already released. ENOTEMPTY: a successor owns the
+        // directory now. Never remove someone else's lock.
       }
     },
   };

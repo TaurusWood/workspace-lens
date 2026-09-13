@@ -109,11 +109,11 @@ export class WorkspaceAdminService {
    */
   async add(input: AddWorkspaceInput): Promise<WorkspaceConfig> {
     return this.withLockRetry(() =>
-      this.configStore.add(input.root, {
-        name: input.name,
-        id: input.id,
-        idBasis: input.idBasis ?? "name",
-      }),
+      this.configStore.add(
+        input.root,
+        { name: input.name, id: input.id, idBasis: input.idBasis ?? "name" },
+        { syncPoints: this.syncPoints },
+      ),
     );
   }
 
@@ -160,7 +160,7 @@ export class WorkspaceAdminService {
 
   /** Remove authorization by workspace_id (or unambiguous name). Files are untouched. */
   async remove(idOrName: string): Promise<WorkspaceConfig> {
-    return this.withLockRetry(() => this.configStore.remove(idOrName));
+    return this.withLockRetry(() => this.configStore.remove(idOrName, { syncPoints: this.syncPoints }));
   }
 
   /** Validate a root candidate without authorizing it. */
