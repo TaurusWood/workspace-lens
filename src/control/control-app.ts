@@ -15,7 +15,9 @@
  * - request body size is bounded before unbounded processing.
  */
 import { Hono } from "hono";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { ConfigStore } from "../config/config-store.js";
+import type { McpHttpBridge } from "../mcp/http.js";
 import { createPackagedUiAssetResolver, type UiAssetResolver } from "./static-assets.js";
 
 /** Default request body cap until the Control API slice tunes per-route DTOs. */
@@ -25,6 +27,8 @@ export interface ControlAppOptions {
   instanceId: string;
   configPath: string;
   assetResolver?: UiAssetResolver;
+  /** Read-only Streamable HTTP MCP bridge (Slice 4); POST /mcp is delegated. */
+  mcpBridge?: McpHttpBridge;
 }
 
 export function createControlApp(options: ControlAppOptions): Hono {
@@ -69,7 +73,16 @@ export function createControlApp(options: ControlAppOptions): Hono {
   });
 
   app.get("/healthz", (context) =>
-    context.json({ status: "ok", runtime_instance_id: options.instanceId }),
+    context.json({
+      status: "ok",
+      runtime_instance_id: options.instanceId,
+      mcp: options.mcpBridge
+        ? {
+            active_requests: options.mcpBridge.metrics.activeRequests,
+            last_request_at: options.mcpBridge.metrics.lastRequestAt,
+          }
+        : undefined,
+    }),
   );
 
   app.get("/readyz", (context) => {
@@ -98,21 +111,45 @@ export function createControlApp(options: ControlAppOptions): Hono {
     return context.newResponse(asset.body, asset.status, { "Content-Type": asset.contentType });
   });
 
-  // Placeholder until Slice 4 mounts the read-only Streamable HTTP MCP
-  // endpoint here. Bounded JSON, no capability leak-through.
-  app.all("/mcp", (context) =>
-    context.json(
-      {
-        jsonrpc: "2.0",
-        id: null,
-        error: {
-          code: -32601,
-          message: "Method not found: MCP over HTTP is not available in this runtime build.",
+  // Read-only Streamable HTTP MCP endpoint (Slice 4): POST is handled by the
+  // stateless bridge over the SAME tool factory the stdio path uses; no
+  // administration capability exists on the MCP surface. Other methods get a
+  // bounded JSON answer (the SDK answers session-less GET/DELETE itself).
+  if (options.mcpBridge !== undefined) {
+    app.post("/mcp", (context) => {
+      const { incoming, outgoing } = context.env as {
+        incoming: IncomingMessage;
+        outgoing: ServerResponse;
+      };
+      return options.mcpBridge!.handlePost(incoming, outgoing).then(() => undefined);
+    });
+    app.all("/mcp", (context) =>
+      context.json(
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32000, message: "Method not allowed on the MCP endpoint." },
         },
-      },
-      404,
-    ),
-  );
+        405,
+      ),
+    );
+  } else {
+    // Placeholder until the bridge exists: bounded JSON, no capability
+    // leak-through.
+    app.all("/mcp", (context) =>
+      context.json(
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32601,
+            message: "Method not found: MCP over HTTP is not available in this runtime build.",
+          },
+        },
+        404,
+      ),
+    );
+  }
 
   // No privileged Control API routes exist yet (Slice 8); nothing falls
   // through from other surfaces.

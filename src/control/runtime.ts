@@ -27,8 +27,10 @@ import { serve } from "@hono/node-server";
 import type { ServerType } from "@hono/node-server";
 import { ConfigError } from "../config/config-schema.js";
 import { defaultConfigPath } from "../config/config-store.js";
+import { StderrLogger } from "../core/logger.js";
 import { createControlApp } from "./control-app.js";
 import { acquireRuntimeLock, type RuntimeLockHandle } from "./runtime-lock.js";
+import { createMcpHttpBridge } from "../mcp/http.js";
 
 export interface ControlRuntimeOptions {
   /** Workspace authorization config file (read-only for the runtime). */
@@ -111,10 +113,19 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
 
   const instanceId = randomUUID();
   const port = options.port ?? 0;
+  const mcpBridge = createMcpHttpBridge({ configPath: options.configPath, logger: new StderrLogger() });
   let server: ServerType;
   try {
     server = serve(
-      { fetch: createControlApp({ instanceId, configPath: options.configPath }).fetch, port, hostname: "127.0.0.1" },
+      {
+        fetch: createControlApp({
+          instanceId,
+          configPath: options.configPath,
+          mcpBridge,
+        }).fetch,
+        port,
+        hostname: "127.0.0.1",
+      },
     );
   } catch (error) {
     lock.handle.release();
