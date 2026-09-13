@@ -125,17 +125,12 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   const instanceId = randomUUID();
   const port = options.port ?? 0;
   const mcpBridge = createMcpHttpBridge({ configPath: options.configPath, logger: new StderrLogger() });
-  let stopped = false;
   let stopPromise: Promise<void> | undefined;
   const stop = (): Promise<void> => {
-    if (stopped) {
-      return Promise.resolve();
-    }
-    // Concurrent and repeated callers share ONE shutdown promise: every
-    // stop() resolves only when the listener is fully stopped and the lock
-    // is released, never before.
+    // Every caller — including ones racing the first call — receives the
+    // SAME shutdown promise, which resolves only after the listener is
+    // fully stopped and the lock is released.
     stopPromise ??= (async () => {
-      stopped = true;
       // Hold singleton ownership until the listener is FULLY stopped: while
       // connections may still drain, releasing the lock could let a second
       // manager bind (a different ephemeral port) and coexist. State and

@@ -317,6 +317,32 @@ describe("HTTP — runtime lock recovery and lifecycle atomicity", () => {
       env.cleanup();
     }
   });
+
+  it("hands the SAME shutdown promise to concurrent stop() callers", async () => {
+    await importExpected("controlRuntime");
+    const env = createIsolatedProductEnv("lock-stoppromise");
+    let runtime: Awaited<ReturnType<typeof startControlRuntime>> | undefined;
+    try {
+      assertNoRealUserState(env);
+      runtime = await startControlRuntime({
+        configPath: env.configPath,
+        runtimeStatePath: env.runtimeStatePath,
+        port: 0,
+      });
+      // Two overlapping stop() calls must share ONE shutdown promise: the
+      // second caller resolves only after the listener is fully stopped and
+      // the lock is released — never with an already-resolved placeholder.
+      const first = runtime.runtime.stop();
+      const second = runtime.runtime.stop();
+      expect(second).toBe(first);
+      await first;
+      // Full shutdown completed before the shared promise settled.
+      await expect(fetch(`${runtime.url}/healthz`)).rejects.toThrow();
+    } finally {
+      await runtime?.runtime.stop();
+      env.cleanup();
+    }
+  });
 });
 
 describe("START — canonical bootstrap (workspace-lens start)", () => {
