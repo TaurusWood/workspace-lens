@@ -27,7 +27,8 @@ import { serve } from "@hono/node-server";
 import type { ServerType } from "@hono/node-server";
 import { ConfigError } from "../config/config-schema.js";
 import { defaultConfigPath } from "../config/config-store.js";
-import { StderrLogger } from "../core/logger.js";
+import { StderrLogger, type Logger } from "../core/logger.js";
+import type { Hono } from "hono";
 import { createControlApp } from "./control-app.js";
 import { acquireRuntimeLock, type RuntimeLockHandle } from "./runtime-lock.js";
 import { createMcpHttpBridge } from "../mcp/http.js";
@@ -52,6 +53,15 @@ export interface ControlRuntimeOptions {
   startupAdapter?: unknown;
   /** Browser launcher seam (Slice 12): opens the WebUI on the user's machine. */
   browserLauncher?: (url: string) => void;
+  /** Metadata-only logger for the MCP surface (defaults to stderr). */
+  logger?: Logger;
+  /**
+   * Hook to assemble additional routes BEFORE the listener starts; called
+   * exactly once with the resolved instance identity. Routes must be added
+   * here — Hono builds its matcher on the first request, so late additions
+   * are rejected.
+   */
+  extendApp?: (app: Hono, runtime: { instanceId: string }) => void;
 }
 
 export interface ControlRuntimeHandle {
@@ -124,7 +134,10 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
 
   const instanceId = randomUUID();
   const port = options.port ?? 0;
-  const mcpBridge = createMcpHttpBridge({ configPath: options.configPath, logger: new StderrLogger() });
+  const mcpBridge = createMcpHttpBridge({
+    configPath: options.configPath,
+    logger: options.logger ?? new StderrLogger(),
+  });
   let stopPromise: Promise<void> | undefined;
   const stop = (): Promise<void> => {
     // Every caller — including ones racing the first call — receives the
@@ -150,14 +163,18 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   // is fully delivered, ANY failure closes the server and releases the lock
   // — a failed start can never leave an orphan listener holding ownership.
   let server: ServerType | undefined;
+  const app = createControlApp({
+    instanceId,
+    configPath: options.configPath,
+    mcpBridge,
+  });
+  // Route assembly happens BEFORE the listener starts: Hono builds its
+  // matcher on the first request, so late additions are rejected.
+  options.extendApp?.(app, { instanceId });
   try {
     server = serve(
       {
-        fetch: createControlApp({
-          instanceId,
-          configPath: options.configPath,
-          mcpBridge,
-        }).fetch,
+        fetch: app.fetch,
         port,
         hostname: "127.0.0.1",
       },

@@ -43,15 +43,25 @@ export interface ConnectionServiceDependencies {
   controlRuntime: { baseUrl: string; isHealthy: () => Promise<boolean> };
   /** Workspace configuration integrity probe (CONN-004). */
   configStore?: { load(): unknown };
-  /** What a connect needs; the literal key travels via the adapter's env reference. */
-  connection?: { alias: string; mcpServerUrl: string; runtimeApiKey?: string };
+  /**
+   * What a connect needs. The literal key never sits in the service: it is
+   * resolved lazily from the credential store at connect time. The MCP URL
+   * resolves lazily too: the runtime's bound port is only known after the
+   * listener is live.
+   */
+  connection?: {
+    alias: string;
+    mcpServerUrl: string | (() => string);
+    runtimeApiKey?: string;
+    getRuntimeApiKey?: () => Promise<string | undefined>;
+  };
 }
 
 export class ConnectionService {
   private readonly adapter: ConnectionAdapter;
   private readonly controlRuntime: { baseUrl: string; isHealthy: () => Promise<boolean> };
   private readonly configStore: { load(): unknown } | undefined;
-  private readonly connection: { alias: string; mcpServerUrl: string; runtimeApiKey?: string } | undefined;
+  private readonly connection: ConnectionServiceDependencies["connection"];
 
   constructor(dependencies: ConnectionServiceDependencies) {
     this.adapter = dependencies.adapter;
@@ -92,7 +102,16 @@ export class ConnectionService {
   }
 
   async connect(): Promise<ConnectionStatusResult> {
-    const input = this.connection ?? undefined;
+    const input = this.connection === undefined
+      ? undefined
+      : {
+          alias: this.connection.alias,
+          mcpServerUrl:
+            typeof this.connection.mcpServerUrl === "function"
+              ? this.connection.mcpServerUrl()
+              : this.connection.mcpServerUrl,
+          runtimeApiKey: (await this.connection.getRuntimeApiKey?.()) ?? this.connection.runtimeApiKey,
+        };
     const raw = await this.adapter.connect(input);
     const state = extractState(raw);
     return {

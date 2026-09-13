@@ -115,6 +115,8 @@ export interface TunnelRuntimeAdapterOptions {
   env?: Record<string, string>;
   organizationId?: string;
   timeoutMs?: number;
+  /** Metadata-only argv capture hook (security contract §18: no secrets in argv). */
+  onInvocation?: (argv: string[]) => void;
 }
 
 export interface ConnectRuntimeInput {
@@ -134,12 +136,14 @@ export class TunnelRuntimeAdapter {
   private readonly env: Record<string, string>;
   private readonly organizationId: string | undefined;
   private readonly timeoutMs: number;
+  private readonly onInvocation: ((argv: string[]) => void) | undefined;
 
   constructor(options: TunnelRuntimeAdapterOptions) {
     this.executable = options.executable;
     this.env = options.env ?? {};
     this.organizationId = options.organizationId;
     this.timeoutMs = options.timeoutMs ?? COMMAND_TIMEOUT_MS;
+    this.onInvocation = options.onInvocation;
   }
 
   /** Detect the managed-runtime binary; a missing binary is a stable error. */
@@ -239,6 +243,7 @@ export class TunnelRuntimeAdapter {
   }
 
   private async run(argv: string[], runtimeApiKey?: string): Promise<CommandResult> {
+    this.onInvocation?.([...argv]);
     const env: Record<string, string> = { ...process.env, ...this.env } as Record<string, string>;
     if (runtimeApiKey !== undefined) {
       env[RUNTIME_API_KEY_ENV] = runtimeApiKey;
