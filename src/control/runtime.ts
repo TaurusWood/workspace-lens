@@ -29,10 +29,12 @@ import { ConfigError } from "../config/config-schema.js";
 import { defaultConfigPath } from "../config/config-store.js";
 import { StderrLogger, type Logger } from "../core/logger.js";
 import { ConfigStore } from "../config/config-store.js";
+import { ControlStateStore } from "../config/control-state-store.js";
 import { ConnectionService } from "../application/connection-service.js";
 import { DiagnosticsService } from "../application/diagnostics-service.js";
 import { PromptHelperService } from "../application/prompt-helper-service.js";
 import { WorkspaceAdminService } from "../application/workspace-admin-service.js";
+import { SettingsService } from "../application/settings-service.js";
 import { TunnelRuntimeAdapter } from "../integrations/openai/tunnel-runtime-adapter.js";
 import type { Hono } from "hono";
 import { registerControlApi } from "./control-app.js";
@@ -296,6 +298,11 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   // Route assembly happens BEFORE the listener starts: Hono builds its
   // matcher on the first request, so late additions are rejected. The origin
   // gate resolves the bound URL lazily and rejects closed until the bind.
+  const settings = new SettingsService({
+    controlStateStore: new ControlStateStore(
+      options.controlStatePath ?? defaultControlStatePath(),
+    ),
+  });
   registerControlApi(app, {
     sessionStore,
     getRuntimeOrigin: () => baseUrl,
@@ -303,6 +310,7 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
     workspaces: new WorkspaceAdminService({ configStore }),
     connection: connectionService,
     helpers: new PromptHelperService(),
+    settings,
     credentials,
     diagnostics: () =>
       new DiagnosticsService({

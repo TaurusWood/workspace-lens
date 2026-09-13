@@ -30,6 +30,7 @@ import type { DiagnosticsCheck } from "../application/contracts.js";
 import { WorkspaceAdminService } from "../application/workspace-admin-service.js";
 import { ConnectionService } from "../application/connection-service.js";
 import { PromptHelperService } from "../application/prompt-helper-service.js";
+import type { SettingsService } from "../application/settings-service.js";
 import type { McpHttpBridge } from "../mcp/http.js";
 import { createPackagedUiAssetResolver, type UiAssetResolver } from "./static-assets.js";
 import {
@@ -58,6 +59,7 @@ export interface ControlApiServices {
   workspaces: WorkspaceAdminService;
   connection: ConnectionService;
   helpers: PromptHelperService;
+  settings: SettingsService;
   credentials: {
     getRuntimeApiKey(): Promise<string | undefined>;
     setRuntimeApiKey(value: string): Promise<void>;
@@ -92,6 +94,13 @@ const credentialsDto = z.object({
 });
 
 const workspaceIdParam = z.string().regex(WORKSPACE_ID_PATTERN).max(WORKSPACE_ID_MAX_LENGTH);
+
+const settingsPatchDto = z
+  .object({
+    startAtLogin: z.boolean().optional(),
+    autoConnect: z.boolean().optional(),
+  })
+  .strict();
 
 export function createControlApp(options: ControlAppOptions): Hono {
   const app = new Hono();
@@ -459,15 +468,38 @@ export function registerControlApi(app: Hono, services: ControlApiServices): voi
   helperRoute("review-prompt");
   helperRoute("plan-prompt");
 
-  // Settings arrive with the control-state slice (Slice 9); the route is
-  // already inside the privileged gate so future behavior inherits every
-  // protection.
-  app.patch("/api/v1/settings", (context) =>
-    context.json(
-      { error: { code: "NOT_IMPLEMENTED", message: "Settings are not part of this runtime build yet." } },
-      501,
-    ),
-  );
+  // Non-secret settings (desired state only). GET refuses query parameters
+  // outright — mutations never travel through GET (SEC-005) — and PATCH is
+  // the single intent-level mutation inside the privileged gate.
+  app.get("/api/v1/settings", async (context) => {
+    if (new URL(context.req.url).search !== "") {
+      return context.json(
+        { error: { code: "INVALID_REQUEST", message: "Settings cannot be changed through GET." } },
+        400,
+      );
+    }
+    return context.json(await services.settings.get());
+  });
+
+  app.patch("/api/v1/settings", async (context) => {
+    const dto = settingsPatchDto.safeParse(await parseJsonBody(context));
+    if (!dto.success) {
+      return dtoError(context, dto.error);
+    }
+    try {
+      return context.json(await services.settings.patch(dto.data));
+    } catch {
+      return context.json(
+        {
+          error: {
+            code: "CONTROL_STATE_INVALID",
+            message: "The control state could not be updated; it may be malformed.",
+          },
+        },
+        500,
+      );
+    }
+  });
 }
 
 async function parseJsonBody(context: { req: { json(): Promise<unknown> } }): Promise<unknown> {
