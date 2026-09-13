@@ -186,8 +186,36 @@ describe("CFG unit — config lock", () => {
     }
   });
 
-  it("release removes only its own owner file and never a directory it no longer owns", () => {
+  it("fails busy promptly on a fresh corrupt owner file; recovers it after the age-out", () => {
     const configPath = newConfigFile();
+    try {
+      // Simulate a writer that crashed mid-JSON: a FRESH corrupt owner file.
+      const lockDir = configLockPath(configPath);
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, "owner-fresh-corrupt"), "{ crashed mid-wri", {
+        mode: 0o600,
+      });
+
+      // Nothing is reclaimable yet, so acquisition must fail BUSY promptly —
+      // never synchronously spinning until the age-out.
+      const startedAt = Date.now();
+      expect(() => acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 10_000 })).toThrow(
+        ConfigLockBusyError,
+      );
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+
+      // Once the remnant ages out, recovery succeeds unconditionally.
+      const past = new Date(Date.now() - 60_000);
+      fs.utimesSync(lockDir, past, past);
+      const recovered = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 10_000 });
+      recovered.release();
+      expect(fs.existsSync(lockDir)).toBe(false);
+    } finally {
+      fs.rmSync(path.dirname(configPath), { recursive: true, force: true });
+    }
+  });
+
+  it("release removes only its own owner file and never a directory it no longer owns", () => {    const configPath = newConfigFile();
     try {
       const handle = acquireConfigLock(configPath, { timeoutMs: 0, staleMs: 60000 });
       // Simulate any foreign owner artifact inside the lock directory.

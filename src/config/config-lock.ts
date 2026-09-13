@@ -127,12 +127,20 @@ function tryAcquire(lockDir: string, token: string): boolean {
     );
     return true;
   } catch (error) {
-    // Never leave an unusable lock behind; owner-less recovery is the
-    // backstop.
+    // Ownership-conditioned cleanup, like release(): remove only our own
+    // owner file (the name embeds our token — this directory was created by
+    // THIS acquisition, so nothing inside it can belong to anyone else) and
+    // then the directory only if empty. No recursive delete. If cleanup
+    // cannot finish, owner-less recovery is the bounded backstop.
     try {
-      fs.rmSync(lockDir, { recursive: true, force: true });
+      fs.unlinkSync(path.join(lockDir, ownerFileName(token)));
     } catch {
-      // ignore
+      // Nothing of ours to remove.
+    }
+    try {
+      fs.rmdirSync(lockDir);
+    } catch {
+      // Non-empty or gone; the age-out rules handle any remnant.
     }
     throw new ConfigError(
       `Cannot write the config lock owner token in ${lockDir}: ` +
@@ -188,7 +196,7 @@ function reclaimIfRecoverable(lockDir: string, staleMs: number): boolean {
   }
 
   const deadOwnerFiles: string[] = [];
-  let corruptFiles: string[] = [];
+  const corruptFiles: string[] = [];
   for (const file of files) {
     let pid: unknown;
     try {
@@ -209,21 +217,35 @@ function reclaimIfRecoverable(lockDir: string, staleMs: number): boolean {
   if (deadOwnerFiles.length === 0 && corruptFiles.length === 0) {
     return false; // unreachable in practice; treat as held
   }
+  let progressed = false;
   for (const file of deadOwnerFiles) {
     try {
       fs.unlinkSync(path.join(lockDir, file));
+      progressed = true;
     } catch {
-      // Another recovery actor got there first.
+      // Another recovery actor got there first; that state change also
+      // warrants one immediate retry.
+      progressed = true;
     }
   }
+  // A corrupt owner file proves no live ownership but is only removed once
+  // the directory ages out (a live writer completes in microseconds). While
+  // it is fresh, NOTHING can be reclaimed here: returning false makes the
+  // acquisition fail busy so the application layer can yield and retry —
+  // returning true would spin this synchronous loop until the age-out.
   if (corruptFiles.length > 0 && isOldEnough(lockDir, staleMs)) {
     for (const file of corruptFiles) {
       try {
         fs.unlinkSync(path.join(lockDir, file));
+        progressed = true;
       } catch {
         // Gone already.
+        progressed = true;
       }
     }
+  }
+  if (!progressed) {
+    return false; // held: nothing was reclaimed, let the caller yield/timeout
   }
   try {
     fs.rmdirSync(lockDir);
