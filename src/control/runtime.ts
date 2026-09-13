@@ -28,7 +28,15 @@ import type { ServerType } from "@hono/node-server";
 import { ConfigError } from "../config/config-schema.js";
 import { defaultConfigPath } from "../config/config-store.js";
 import { StderrLogger, type Logger } from "../core/logger.js";
+import { ConfigStore } from "../config/config-store.js";
+import { ConnectionService } from "../application/connection-service.js";
+import { DiagnosticsService } from "../application/diagnostics-service.js";
+import { PromptHelperService } from "../application/prompt-helper-service.js";
+import { WorkspaceAdminService } from "../application/workspace-admin-service.js";
+import { TunnelRuntimeAdapter } from "../integrations/openai/tunnel-runtime-adapter.js";
 import type { Hono } from "hono";
+import { registerControlApi } from "./control-app.js";
+import { SessionStore } from "./session-store.js";
 import { createControlApp } from "./control-app.js";
 import { acquireRuntimeLock, type RuntimeLockHandle } from "./runtime-lock.js";
 import { createMcpHttpBridge } from "../mcp/http.js";
@@ -42,13 +50,14 @@ export interface ControlRuntimeOptions {
   runtimeStatePath: string;
   /** Ephemeral port when 0/unset; never exposes a host choice. */
   port?: number;
-  // The following seams exist so ONE runtime wiring serves every later
-  // surface; the slices that own them read them from the runtime context.
-  /** SecretStore seam (Slice 10): injected OS-credential adapter object. */
-  secretAdapter?: unknown;
+  // The following seams exist so ONE runtime wiring serves every surface;
+  // absent adapters degrade honestly (e.g. no credential store -> the
+  // credential routes report store_available: false, never plaintext).
+  /** Credential adapter (Slice 10): injected OS-credential adapter object. */
+  secretAdapter?: CredentialStoreAdapter;
   secretNamespace?: string;
-  /** Tunnel managed-runtime seam (Slice 6): injected adapter object. */
-  tunnelAdapter?: unknown;
+  /** Managed-runtime adapter (Slice 6): injected adapter object. */
+  tunnelAdapter?: ManagedRuntimeAdapter;
   /** Startup manager seam (Slice 17): injected adapter object. */
   startupAdapter?: unknown;
   /** Browser launcher seam (Slice 12): opens the WebUI on the user's machine. */
@@ -72,11 +81,60 @@ export interface ControlRuntimeHandle {
   reused: boolean;
   /** Instance identity of the STARTED runtime (empty for a reuse). */
   instanceId: string;
+  /** Metadata-only log capture (security contract §18); bounded. */
+  capturedLogs: unknown[];
+  /** Captured child-process argv (reference arguments only); bounded. */
+  capturedChildArgv: string[][];
   runtime: {
     baseUrl: string;
     /** Idempotent: closes the listener and releases the singleton lock. */
     stop(): Promise<void>;
   };
+}
+
+export interface CredentialStoreAdapter {
+  available(): Promise<boolean>;
+  get(name: string): Promise<string | undefined>;
+  set(name: string, value: string): Promise<void>;
+  delete(name: string): Promise<void>;
+}
+
+export interface ManagedRuntimeAdapter {
+  detect(): Promise<{ installed: boolean; version?: string }>;
+  connect(input: unknown): Promise<unknown>;
+  status(alias: string): Promise<unknown>;
+  stop(alias: string): Promise<unknown>;
+  restart(input: unknown): Promise<unknown>;
+}
+
+const CREDENTIAL_NAME = "runtime-api-key";
+const CAPTURE_LIMIT = 500;
+
+class CapturingLogger implements Logger {
+  private count = 0;
+
+  constructor(private readonly sink: unknown[]) {}
+
+  private record(entry: Record<string, unknown>): void {
+    // Bounded capture: runtime evidence, never a growing history store.
+    if (this.count >= CAPTURE_LIMIT) {
+      return;
+    }
+    this.count += 1;
+    this.sink.push(entry);
+  }
+
+  toolCall(fields: Record<string, unknown>): void {
+    this.record({ event: "tool_call", ...fields });
+  }
+
+  event(event: string, detail?: string): void {
+    this.record({ event, detail });
+  }
+
+  error(event: string, message: string): void {
+    this.record({ event, level: "error", detail: message });
+  }
 }
 
 interface RuntimeStateFile {
@@ -90,6 +148,8 @@ const HEALTH_PROBE_TIMEOUT_MS = 1500;
 
 export async function startControlRuntime(options: ControlRuntimeOptions): Promise<ControlRuntimeHandle> {
   const runtimeStatePath = path.resolve(options.runtimeStatePath);
+  const capturedLogs: unknown[] = [];
+  const capturedChildArgv: string[][] = [];
   const lock = acquireRuntimeLock(runtimeStatePath);
 
   if (!lock.acquired) {
@@ -110,6 +170,8 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
         baseUrl: existing.baseUrl,
         reused: true,
         instanceId: "",
+        capturedLogs,
+        capturedChildArgv,
         runtime: {
           baseUrl: existing.baseUrl,
           // The reuser does not own the runtime; stopping it must not stop
@@ -136,8 +198,71 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   const port = options.port ?? 0;
   const mcpBridge = createMcpHttpBridge({
     configPath: options.configPath,
-    logger: options.logger ?? new StderrLogger(),
+    logger: options.logger ?? new CapturingLogger(capturedLogs),
   });
+
+  // The privileged Control API is part of the runtime's default wiring: the
+  // management routes exist under the full session gate for every caller
+  // (CLI control, launcher child). Absent adapters degrade honestly.
+  const credentialStore = options.secretAdapter;
+  const credentials = {
+    getRuntimeApiKey(): Promise<string | undefined> {
+      return credentialStore !== undefined
+        ? credentialStore.get(CREDENTIAL_NAME)
+        : Promise.resolve(undefined);
+    },
+    setRuntimeApiKey(value: string): Promise<void> {
+      if (credentialStore === undefined) {
+        // No plaintext fallback exists (security contract §10.2).
+        return Promise.reject(
+          new Error("No credential store is available; no plaintext fallback is used."),
+        );
+      }
+      return credentialStore.set(CREDENTIAL_NAME, value);
+    },
+    storeAvailable(): Promise<boolean> {
+      return credentialStore !== undefined
+        ? credentialStore.available()
+        : Promise.resolve(false);
+    },
+  };
+  const realAdapter =
+    options.tunnelAdapter === undefined
+      ? new TunnelRuntimeAdapter({
+          executable: "tunnel-client",
+          // Child argv is captured metadata-only; the literal key travels via
+          // the child env and never appears in argv.
+          onInvocation: (argv) => {
+            if (capturedChildArgv.length < CAPTURE_LIMIT) {
+              capturedChildArgv.push(argv);
+            }
+          },
+        })
+      : undefined;
+  const managedAdapter: ManagedRuntimeAdapter =
+    options.tunnelAdapter ??
+    ({
+      detect: () => realAdapter!.detect(),
+      connect: (input: unknown) => realAdapter!.connect(input as never),
+      status: (alias: string) => realAdapter!.status(alias),
+      stop: (alias: string) => realAdapter!.stop(alias),
+      restart: (input: unknown) => realAdapter!.restart("workspace-lens", input as never),
+    });
+  const configStore = new ConfigStore(options.configPath);
+  const connectionService = new ConnectionService({
+    adapter: managedAdapter,
+    controlRuntime: { baseUrl: "", isHealthy: async () => true },
+    configStore: { load: () => configStore.load() },
+    connection: {
+      alias: "workspace-lens",
+      // Resolved lazily: the bound port is only known once the listener is
+      // live, before any connect can be issued.
+      mcpServerUrl: () => `${baseUrl}/mcp`,
+      getRuntimeApiKey: credentials.getRuntimeApiKey,
+    },
+  });
+  let baseUrl = "";
+  const sessionStore = new SessionStore();
   let stopPromise: Promise<void> | undefined;
   const stop = (): Promise<void> => {
     // Every caller — including ones racing the first call — receives the
@@ -169,8 +294,25 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
     mcpBridge,
   });
   // Route assembly happens BEFORE the listener starts: Hono builds its
-  // matcher on the first request, so late additions are rejected.
-  options.extendApp?.(app, { instanceId });
+  // matcher on the first request, so late additions are rejected. The origin
+  // gate resolves the bound URL lazily and rejects closed until the bind.
+  registerControlApi(app, {
+    sessionStore,
+    getRuntimeOrigin: () => baseUrl,
+    instanceId,
+    workspaces: new WorkspaceAdminService({ configStore }),
+    connection: connectionService,
+    helpers: new PromptHelperService(),
+    credentials,
+    diagnostics: () =>
+      new DiagnosticsService({
+        configStore,
+        detectTunnel:
+          options.tunnelAdapter !== undefined
+            ? () => options.tunnelAdapter!.detect()
+            : undefined,
+      }).run(),
+  });
   try {
     server = serve(
       {
@@ -187,7 +329,7 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
       throw new ConfigError("Control Runtime refused to start: the listener is not loopback-only.");
     }
     const boundPort = address.port;
-    const baseUrl = `http://127.0.0.1:${boundPort}`;
+    baseUrl = `http://127.0.0.1:${boundPort}`;
     writeRuntimeState(runtimeStatePath, {
       baseUrl,
       pid: process.pid,
@@ -199,6 +341,8 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
       baseUrl,
       reused: false,
       instanceId,
+      capturedLogs,
+      capturedChildArgv,
       runtime: { baseUrl, stop },
     };
   } catch (error) {

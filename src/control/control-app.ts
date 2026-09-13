@@ -29,6 +29,7 @@ import { WORKSPACE_ID_MAX_LENGTH, WORKSPACE_ID_PATTERN } from "../config/config-
 import type { DiagnosticsCheck } from "../application/contracts.js";
 import { WorkspaceAdminService } from "../application/workspace-admin-service.js";
 import { ConnectionService } from "../application/connection-service.js";
+import { PromptHelperService } from "../application/prompt-helper-service.js";
 import type { McpHttpBridge } from "../mcp/http.js";
 import { createPackagedUiAssetResolver, type UiAssetResolver } from "./static-assets.js";
 import {
@@ -56,6 +57,7 @@ export interface ControlApiServices {
   instanceId: string;
   workspaces: WorkspaceAdminService;
   connection: ConnectionService;
+  helpers: PromptHelperService;
   credentials: {
     getRuntimeApiKey(): Promise<string | undefined>;
     setRuntimeApiKey(value: string): Promise<void>;
@@ -422,6 +424,40 @@ export function registerControlApi(app: Hono, services: ControlApiServices): voi
   app.get("/api/v1/diagnostics", async (context) =>
     context.json({ checks: await services.diagnostics() }),
   );
+
+  // Prompt helpers: stateless generation from stable workspace identity
+  // (security contract §2.2 — bounded convenience, no filesystem access and
+  // no workflow state). Unknown workspaces are a bounded 404.
+  const helperDto = z.object({
+    workspace_id: workspaceIdParam,
+    root: z.string().optional(),
+  });
+  const helperRoute = (kind: "project-instructions" | "review-prompt" | "plan-prompt") => {
+    app.post(`/api/v1/helpers/${kind}`, async (context) => {
+      const dto = helperDto.safeParse(await parseJsonBody(context));
+      if (!dto.success) {
+        return dtoError(context, dto.error);
+      }
+      const known = services.workspaces.list().some((ws) => ws.workspace_id === dto.data.workspace_id);
+      if (!known) {
+        return context.json(
+          { error: { code: "WORKSPACE_NOT_FOUND", message: "Unknown workspace_id." } },
+          404,
+        );
+      }
+      const input = { workspaceId: dto.data.workspace_id, root: dto.data.root };
+      const prompt =
+        kind === "project-instructions"
+          ? services.helpers.projectInstructions(input)
+          : kind === "review-prompt"
+            ? services.helpers.reviewPrompt(input)
+            : services.helpers.planPrompt(input);
+      return context.json({ workspace_id: dto.data.workspace_id, prompt });
+    });
+  };
+  helperRoute("project-instructions");
+  helperRoute("review-prompt");
+  helperRoute("plan-prompt");
 
   // Settings arrive with the control-state slice (Slice 9); the route is
   // already inside the privileged gate so future behavior inherits every

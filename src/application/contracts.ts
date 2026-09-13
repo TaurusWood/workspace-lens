@@ -98,13 +98,20 @@ export interface SettingsService {
   patch(patch: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
-export type PromptHelperKind = "project-instructions" | "review-prompt" | "plan-prompt";
+export interface PromptHelperInput {
+  /** Stable workspace identity the helper targets. */
+  workspaceId: string;
+  /** Optional canonical root context; never embedded in generated text. */
+  root?: string;
+}
 
 export interface PromptHelperService {
   /**
-   * Generate one optional helper from stable workspace identity
+   * Generate the optional copy helpers from stable workspace identity
    * (`v0.3-test-contract.md` §12 HELP-001/002). Stateless: no saved prompt
-   * library and no workflow/session records.
+   * library, no workflow/session/task records, nothing stored on the service.
    */
-  generate(kind: PromptHelperKind, workspaceId: string): Promise<string>;
+  projectInstructions(input: PromptHelperInput): string;
+  reviewPrompt(input: PromptHelperInput): string;
+  planPrompt(input: PromptHelperInput): string;
 }
