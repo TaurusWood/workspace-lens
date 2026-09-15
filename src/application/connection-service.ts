@@ -38,9 +38,9 @@ const NEXT_ACTIONS: Partial<Record<TunnelRuntimeState, string>> = {
 
 export interface ConnectionAdapter {
   status(alias?: string): Promise<unknown>;
-  connect(input?: ConnectionRuntimeInput): Promise<unknown>;
+  connect(input: ConnectionRuntimeInput): Promise<unknown>;
   stop?(alias?: string): Promise<unknown>;
-  restart?(input?: ConnectionRuntimeInput): Promise<unknown>;
+  restart?(input: ConnectionRuntimeInput): Promise<unknown>;
 }
 
 export interface ConnectionServiceDependencies {
@@ -106,16 +106,25 @@ export class ConnectionService {
     return this.connect();
   }
 
-  private async resolveConnectionInput(): Promise<ConnectionRuntimeInput | undefined> {
+  private async resolveConnectionInput(): Promise<ConnectionRuntimeInput> {
     if (this.connection === undefined) {
-      return undefined;
+      throw new Error("Connection configuration is missing; connect cannot proceed.");
     }
     const runtimeApiKey =
-      (await this.connection.getRuntimeApiKey?.()) ?? this.connection.runtimeApiKey ?? "";
+      (await this.connection.getRuntimeApiKey?.()) ?? this.connection.runtimeApiKey;
+    if (typeof runtimeApiKey !== "string" || runtimeApiKey.trim() === "") {
+      throw new Error("Runtime API key is missing or empty; connect cannot proceed.");
+    }
     const mcpServerUrl =
       typeof this.connection.mcpServerUrl === "function"
         ? this.connection.mcpServerUrl()
         : this.connection.mcpServerUrl;
+    if (typeof mcpServerUrl !== "string" || mcpServerUrl.trim() === "") {
+      throw new Error("MCP server URL is missing or unresolved; connect cannot proceed.");
+    }
+    if (typeof this.connection.alias !== "string" || this.connection.alias.trim() === "") {
+      throw new Error("Tunnel alias is missing or empty; connect cannot proceed.");
+    }
     return {
       alias: this.connection.alias,
       mcpServerUrl,

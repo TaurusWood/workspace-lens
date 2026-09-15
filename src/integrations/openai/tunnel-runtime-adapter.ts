@@ -20,7 +20,11 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ConnectionRuntimeInput, TunnelRuntimeState } from "../../application/contracts.js";
+import {
+  CONNECTION_ADAPTER_ERROR_CODES,
+  type ConnectionRuntimeInput,
+  type TunnelRuntimeState,
+} from "../../application/contracts.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -193,7 +197,10 @@ export class TunnelRuntimeAdapter {
     try {
       await this.stop(input.alias);
     } catch (error) {
-      if (!(error instanceof TunnelAdapterError) || error.code !== "ALIAS_MISSING") {
+      if (
+        !(error instanceof TunnelAdapterError) ||
+        error.code !== CONNECTION_ADAPTER_ERROR_CODES.ALIAS_MISSING
+      ) {
         throw error;
       }
     }
@@ -214,7 +221,7 @@ export class TunnelRuntimeAdapter {
     });
     if (normalized.state === "missing") {
       throw new TunnelAdapterError(
-        "ALIAS_MISSING",
+        CONNECTION_ADAPTER_ERROR_CODES.ALIAS_MISSING,
         `The tunnel runtime alias "${alias}" is missing; run connect first.`,
       );
     }
@@ -226,7 +233,10 @@ export class TunnelRuntimeAdapter {
     }
     const state = structuredState(result.stdout, command === "stop" ? "stopped" : "starting");
     if (state === "unhealthy") {
-      throw new TunnelAdapterError("TUNNEL_UNHEALTHY", "tunnel runtime is unhealthy.");
+      throw new TunnelAdapterError(
+        CONNECTION_ADAPTER_ERROR_CODES.TUNNEL_UNHEALTHY,
+        "tunnel runtime is unhealthy.",
+      );
     }
     if (state === "problem") {
       throw new TunnelAdapterError(
