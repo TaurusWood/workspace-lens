@@ -235,10 +235,28 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
       },
     });
   const configStore = new ConfigStore(options.configPath);
+  const settings = new SettingsService({
+    controlStateStore: new ControlStateStore(
+      options.controlStatePath ?? defaultControlStatePath(),
+    ),
+  });
   const connectionService = new ConnectionService({
     adapter: managedAdapter,
     controlRuntime: { baseUrl: "", isHealthy: async () => true },
     configStore: { load: () => configStore.load() },
+    credentialStatus: {
+      isConfigured: async () => (await credentials.getRuntimeApiKey()) !== undefined,
+      storeAvailable: () => credentials.storeAvailable(),
+    },
+    controlStateReader: {
+      getConfirmations: async () => {
+        const current = await settings.get();
+        return {
+          providerSetupUserConfirmed: current.providerSetupUserConfirmed,
+          verificationUserConfirmed: current.verificationUserConfirmed,
+        };
+      },
+    },
     connection: {
       alias: "workspace-lens",
       // Resolved lazily: the bound port is only known once the listener is
@@ -282,11 +300,6 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   // Route assembly happens BEFORE the listener starts: Hono builds its
   // matcher on the first request, so late additions are rejected. The origin
   // gate resolves the bound URL lazily and rejects closed until the bind.
-  const settings = new SettingsService({
-    controlStateStore: new ControlStateStore(
-      options.controlStatePath ?? defaultControlStatePath(),
-    ),
-  });
   registerControlApi(app, {
     sessionStore,
     getRuntimeOrigin: () => baseUrl,

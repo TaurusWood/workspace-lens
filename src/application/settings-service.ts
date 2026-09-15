@@ -11,11 +11,15 @@ import type { ControlStateStore } from "../config/control-state-store.js";
 export interface SettingsPatch {
   startAtLogin?: boolean;
   autoConnect?: boolean;
+  providerSetupUserConfirmed?: boolean;
+  verificationUserConfirmed?: boolean;
 }
 
 export interface SettingsView {
   startAtLogin: boolean;
   autoConnect: boolean;
+  providerSetupUserConfirmed: boolean;
+  verificationUserConfirmed: boolean;
 }
 
 export class SettingsService {
@@ -27,7 +31,12 @@ export class SettingsService {
 
   async get(): Promise<SettingsView> {
     const document = this.store.load();
-    return { startAtLogin: document.preferences.startAtLogin, autoConnect: document.preferences.autoConnect };
+    return {
+      startAtLogin: document.preferences.startAtLogin,
+      autoConnect: document.preferences.autoConnect,
+      providerSetupUserConfirmed: document.preferences.providerSetupUserConfirmed,
+      verificationUserConfirmed: document.preferences.verificationUserConfirmed,
+    };
   }
 
   async patch(patch: SettingsPatch): Promise<SettingsView> {
@@ -38,7 +47,18 @@ export class SettingsService {
     if (patch.autoConnect !== undefined) {
       document.preferences.autoConnect = patch.autoConnect;
     }
+    if (patch.providerSetupUserConfirmed !== undefined) {
+      document.preferences.providerSetupUserConfirmed = patch.providerSetupUserConfirmed;
+    }
+    if (patch.verificationUserConfirmed !== undefined) {
+      document.preferences.verificationUserConfirmed = patch.verificationUserConfirmed;
+    }
     this.store.save(document);
-    return { startAtLogin: document.preferences.startAtLogin, autoConnect: document.preferences.autoConnect };
+    return {
+      startAtLogin: document.preferences.startAtLogin,
+      autoConnect: document.preferences.autoConnect,
+      providerSetupUserConfirmed: document.preferences.providerSetupUserConfirmed,
+      verificationUserConfirmed: document.preferences.verificationUserConfirmed,
+    };
   }
 }

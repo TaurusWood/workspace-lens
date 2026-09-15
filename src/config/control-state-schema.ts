@@ -17,19 +17,33 @@ export const CONTROL_STATE_VERSION = 1;
 export const controlStateSchema = z
   .object({
     version: z.literal(CONTROL_STATE_VERSION),
-    preferences: z.object({
-      /** Desired state: connect the tunnel runtime after startup. */
-      autoConnect: z.boolean(),
-      /** Desired state: launch the Control Runtime at login. */
-      startAtLogin: z.boolean(),
-    }),
+    preferences: z
+      .object({
+        /** Desired state: connect the tunnel runtime after startup. */
+        autoConnect: z.boolean(),
+        /** Desired state: launch the Control Runtime at login. */
+        startAtLogin: z.boolean(),
+        /** User-owned confirmation: ChatGPT/provider side setup completed by user. */
+        providerSetupUserConfirmed: z.boolean().default(false),
+        /** User-owned confirmation: verified from ChatGPT by user. */
+        verificationUserConfirmed: z.boolean().default(false),
+      })
+      .strict(),
   })
   .strict();
 
 export type ControlStateDocument = z.infer<typeof controlStateSchema>;
 
 export function defaultControlState(): ControlStateDocument {
-  return { version: CONTROL_STATE_VERSION, preferences: { autoConnect: false, startAtLogin: false } };
+  return {
+    version: CONTROL_STATE_VERSION,
+    preferences: {
+      autoConnect: false,
+      startAtLogin: false,
+      providerSetupUserConfirmed: false,
+      verificationUserConfirmed: false,
+    },
+  };
 }
 
 /** Parse persisted control state; any structural problem fails closed. */

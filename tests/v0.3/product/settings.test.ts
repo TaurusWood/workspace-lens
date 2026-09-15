@@ -50,10 +50,17 @@ describe("CONTROL STATE — store", () => {
       const document = store.load();
       expect(document).toMatchObject({
         version: 1,
-        preferences: { startAtLogin: false, autoConnect: false },
+        preferences: {
+          startAtLogin: false,
+          autoConnect: false,
+          providerSetupUserConfirmed: false,
+          verificationUserConfirmed: false,
+        },
       });
 
       document.preferences.startAtLogin = true;
+      document.preferences.providerSetupUserConfirmed = true;
+      document.preferences.verificationUserConfirmed = true;
       store.save(document);
 
       // Restrictive permissions, no temp leftovers.
@@ -64,6 +71,8 @@ describe("CONTROL STATE — store", () => {
       // Round trip.
       const reloaded = new ControlStateStore(filePath).load();
       expect(reloaded.preferences.startAtLogin).toBe(true);
+      expect(reloaded.preferences.providerSetupUserConfirmed).toBe(true);
+      expect(reloaded.preferences.verificationUserConfirmed).toBe(true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -122,23 +131,38 @@ describe("CONTROL STATE — settings API", () => {
 
       const before = await fetch(`${child.url}/api/v1/settings`, { headers: { cookie: session.cookie } });
       expect(before.status).toBe(200);
-      expect((await before.json()) as any).toMatchObject({ startAtLogin: false, autoConnect: false });
+      expect((await before.json()) as any).toMatchObject({
+        startAtLogin: false,
+        autoConnect: false,
+        providerSetupUserConfirmed: false,
+        verificationUserConfirmed: false,
+      });
 
       const patched = await apiRequest(
         child.url,
         "/api/v1/settings",
-        { startAtLogin: true },
+        {
+          startAtLogin: true,
+          providerSetupUserConfirmed: true,
+          verificationUserConfirmed: true,
+        },
         { cookie: session.cookie, csrf: session.csrf, origin },
         "PATCH",
       );
       expect(patched.status).toBe(200);
-      expect((await patched.json()) as any).toMatchObject({ startAtLogin: true });
+      expect((await patched.json()) as any).toMatchObject({
+        startAtLogin: true,
+        providerSetupUserConfirmed: true,
+        verificationUserConfirmed: true,
+      });
 
       // Desired state persisted to the control state document (0600).
       const persisted = JSON.parse(
         fs.readFileSync(env.controlStatePath, "utf8"),
       ) as any;
       expect(persisted.preferences.startAtLogin).toBe(true);
+      expect(persisted.preferences.providerSetupUserConfirmed).toBe(true);
+      expect(persisted.preferences.verificationUserConfirmed).toBe(true);
       expect(fs.statSync(env.controlStatePath).mode & 0o777).toBe(0o600);
 
       // Unknown/secret-shaped fields are rejected with no partial mutation.

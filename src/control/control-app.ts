@@ -99,6 +99,8 @@ const settingsPatchDto = z
   .object({
     startAtLogin: z.boolean().optional(),
     autoConnect: z.boolean().optional(),
+    providerSetupUserConfirmed: z.boolean().optional(),
+    verificationUserConfirmed: z.boolean().optional(),
   })
   .strict();
 

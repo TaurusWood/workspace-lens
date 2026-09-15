@@ -12,8 +12,11 @@
  */
 import {
   CONNECTION_ADAPTER_ERROR_CODES,
+  type ConnectionLayers,
   type ConnectionRuntimeInput,
   type ConnectionStatusResult,
+  type ControlStateReaderPort,
+  type CredentialStatusPort,
   type TunnelRuntimeState,
 } from "./contracts.js";
 
@@ -27,19 +30,11 @@ const FROZEN_STATES: TunnelRuntimeState[] = [
   "problem",
 ];
 
-/** Bounded, actionable next steps per product state. */
-const NEXT_ACTIONS: Partial<Record<TunnelRuntimeState, string>> = {
-  missing: "Connect to create the tunnel runtime for this machine.",
-  stopped: "Connect to start the tunnel runtime.",
-  unhealthy: "Open Diagnostics and follow the connection recovery steps.",
-  recovering: "The runtime is recovering; wait for the next status update.",
-  problem: "Open Diagnostics and follow the connection recovery steps.",
-};
-
 export interface ConnectionAdapter {
-  status(alias?: string): Promise<unknown>;
+  detect?(): Promise<{ installed: boolean; version?: string }>;
+  status(alias: string): Promise<unknown>;
   connect(input: ConnectionRuntimeInput): Promise<unknown>;
-  stop?(alias?: string): Promise<unknown>;
+  stop?(alias: string): Promise<unknown>;
   restart?(input: ConnectionRuntimeInput): Promise<unknown>;
 }
 
@@ -48,6 +43,10 @@ export interface ConnectionServiceDependencies {
   controlRuntime: { baseUrl: string; isHealthy: () => Promise<boolean> };
   /** Workspace configuration integrity probe (CONN-004). */
   configStore?: { load(): unknown };
+  /** Safe non-secret port for querying credential status. */
+  credentialStatus?: CredentialStatusPort;
+  /** Non-secret reader port for user-owned setup/verification confirmations. */
+  controlStateReader?: ControlStateReaderPort;
   /**
    * What a connect needs. The literal key never sits in the service: it is
    * resolved lazily from the credential store at connect time. The MCP URL
@@ -66,30 +65,203 @@ export class ConnectionService {
   private readonly adapter: ConnectionAdapter;
   private readonly controlRuntime: { baseUrl: string; isHealthy: () => Promise<boolean> };
   private readonly configStore: { load(): unknown } | undefined;
+  private readonly credentialStatus: CredentialStatusPort | undefined;
+  private readonly controlStateReader: ControlStateReaderPort | undefined;
   private readonly connection: ConnectionServiceDependencies["connection"];
 
   constructor(dependencies: ConnectionServiceDependencies) {
     this.adapter = dependencies.adapter;
     this.controlRuntime = dependencies.controlRuntime;
     this.configStore = dependencies.configStore;
+    this.credentialStatus = dependencies.credentialStatus;
+    this.controlStateReader = dependencies.controlStateReader;
     this.connection = dependencies.connection;
   }
 
-  /** Normalized current connection state; failures are actionable, not fatal. */
+  /** Normalized current connection state across the frozen layers. */
   async currentStatus(): Promise<ConnectionStatusResult> {
     const workspaceConfigurationIntact = await this.configurationIntact();
-    let state: TunnelRuntimeState;
-    try {
-      state = extractState(await this.adapter.status(this.connection?.alias));
-    } catch (error: unknown) {
-      // Bounded failure: actionable state, never a control-plane crash and
-      // never a claim that the provider side is fine.
-      state = mapAdapterErrorToState(error);
+    const confirmations = await this.resolveConfirmations();
+    const credStatus = await this.resolveCredentialStatus();
+
+    const localRuntime = {
+      state: "healthy" as const,
+      evidence: "machine" as const,
+    };
+
+    let tunnelClientState: "available" | "missing" | "problem" = "available";
+    let tunnelClientAction: string | undefined;
+
+    let tunnelRuntimeState: TunnelRuntimeState = "missing";
+    let tunnelRuntimeAction: string | undefined;
+    let isAliasMissing = false;
+
+    const alias = (this.connection?.alias ?? "workspace-lens").trim();
+
+    if (alias === "") {
+      if (this.adapter.detect !== undefined) {
+        try {
+          const detected = await this.adapter.detect();
+          if (detected.installed) {
+            tunnelClientState = "available";
+          } else {
+            tunnelClientState = "missing";
+            tunnelClientAction = "Install the tunnel-client executable.";
+          }
+        } catch (error: unknown) {
+          if (isBinaryMissing(error)) {
+            tunnelClientState = "missing";
+            tunnelClientAction = "Install the tunnel-client executable.";
+          } else {
+            tunnelClientState = "problem";
+            tunnelClientAction = "Check tunnel-client installation or open Diagnostics.";
+          }
+        }
+      }
+      tunnelRuntimeState = "missing";
+    } else {
+      try {
+        const raw = await this.adapter.status(alias);
+        tunnelRuntimeState = extractState(raw);
+        tunnelClientState = "available";
+        if (tunnelRuntimeState === "unhealthy" || tunnelRuntimeState === "problem") {
+          tunnelRuntimeAction = "Open Diagnostics and follow the connection recovery steps.";
+        }
+      } catch (error: unknown) {
+        if (isAliasMissingError(error)) {
+          isAliasMissing = true;
+          tunnelClientState = "available";
+          tunnelRuntimeState = "missing";
+        } else if (isTunnelUnhealthyError(error)) {
+          tunnelClientState = "available";
+          tunnelRuntimeState = "unhealthy";
+          tunnelRuntimeAction = "Open Diagnostics and follow the connection recovery steps.";
+        } else if (isBinaryMissing(error)) {
+          tunnelClientState = "missing";
+          tunnelClientAction = "Install the tunnel-client executable.";
+          tunnelRuntimeState = "missing";
+        } else {
+          tunnelClientState = "available";
+          tunnelRuntimeState = "problem";
+          tunnelRuntimeAction = "Open Diagnostics and follow the connection recovery steps.";
+        }
+      }
     }
+
+    let tunnelConfigurationState: "configured" | "not-configured" | "action-required";
+    let tunnelConfigurationAction: string | undefined;
+
+    if (!credStatus.storeAvailable) {
+      tunnelConfigurationState = "action-required";
+      tunnelConfigurationAction =
+        "The credential store is unavailable; ensure system keychain is accessible.";
+    } else if (!credStatus.configured) {
+      tunnelConfigurationState = "action-required";
+      tunnelConfigurationAction = "Store the runtime API key before connecting.";
+    } else if (alias === "") {
+      tunnelConfigurationState = "action-required";
+      tunnelConfigurationAction = "Configure tunnel alias.";
+    } else if (tunnelClientState === "missing") {
+      tunnelConfigurationState = "action-required";
+      tunnelConfigurationAction = "Install the tunnel-client executable.";
+    } else if (isAliasMissing) {
+      tunnelConfigurationState = "not-configured";
+      tunnelConfigurationAction = "Connect to create the tunnel runtime for this machine.";
+    } else {
+      tunnelConfigurationState = "configured";
+    }
+
+    const providerSetup = {
+      state: confirmations.providerSetupUserConfirmed
+        ? ("user-confirmed" as const)
+        : ("not-confirmed" as const),
+      evidence: confirmations.providerSetupUserConfirmed
+        ? ("user" as const)
+        : ("none" as const),
+    };
+
+    const verification = {
+      state: confirmations.verificationUserConfirmed
+        ? ("user-confirmed" as const)
+        : ("not-confirmed" as const),
+      evidence: confirmations.verificationUserConfirmed
+        ? ("user" as const)
+        : ("none" as const),
+    };
+
+    const layers: ConnectionLayers = {
+      localRuntime,
+      tunnelClient: {
+        state: tunnelClientState,
+        evidence: "machine",
+        ...(tunnelClientAction !== undefined ? { action: tunnelClientAction } : {}),
+      },
+      tunnelConfiguration: {
+        state: tunnelConfigurationState,
+        evidence: "machine",
+        ...(tunnelConfigurationAction !== undefined ? { action: tunnelConfigurationAction } : {}),
+      },
+      tunnelRuntime: {
+        state: tunnelRuntimeState,
+        evidence: "machine",
+        ...(tunnelRuntimeAction !== undefined ? { action: tunnelRuntimeAction } : {}),
+      },
+      providerSetup,
+      verification,
+    };
+
+    const nextAction = computeNextAction(layers);
+
     return {
-      state,
-      nextAction: NEXT_ACTIONS[state],
+      state: layers.tunnelRuntime.state,
+      nextAction,
       workspaceConfigurationIntact,
+      layers,
+    };
+  }
+
+  private async composeStatus(runtimeState: TunnelRuntimeState): Promise<ConnectionStatusResult> {
+    const workspaceConfigurationIntact = await this.configurationIntact();
+    const confirmations = await this.resolveConfirmations();
+
+    let tunnelRuntimeAction: string | undefined;
+    if (runtimeState === "unhealthy" || runtimeState === "problem") {
+      tunnelRuntimeAction = "Open Diagnostics and follow the connection recovery steps.";
+    }
+
+    const layers: ConnectionLayers = {
+      localRuntime: {
+        state: "healthy",
+        evidence: "machine",
+      },
+      tunnelClient: {
+        state: "available",
+        evidence: "machine",
+      },
+      tunnelConfiguration: {
+        state: "configured",
+        evidence: "machine",
+      },
+      tunnelRuntime: {
+        state: runtimeState,
+        evidence: "machine",
+        ...(tunnelRuntimeAction !== undefined ? { action: tunnelRuntimeAction } : {}),
+      },
+      providerSetup: {
+        state: confirmations.providerSetupUserConfirmed ? "user-confirmed" : "not-confirmed",
+        evidence: confirmations.providerSetupUserConfirmed ? "user" : "none",
+      },
+      verification: {
+        state: confirmations.verificationUserConfirmed ? "user-confirmed" : "not-confirmed",
+        evidence: confirmations.verificationUserConfirmed ? "user" : "none",
+      },
+    };
+
+    return {
+      state: runtimeState,
+      nextAction: computeNextAction(layers),
+      workspaceConfigurationIntact,
+      layers,
     };
   }
 
@@ -136,11 +308,7 @@ export class ConnectionService {
     const input = await this.resolveConnectionInput();
     const raw = await this.adapter.connect(input);
     const state = extractState(raw);
-    return {
-      state,
-      nextAction: NEXT_ACTIONS[state],
-      workspaceConfigurationIntact: await this.configurationIntact(),
-    };
+    return this.composeStatus(state);
   }
 
   /** Idempotent start: an already-healthy connection is reused. */
@@ -153,33 +321,25 @@ export class ConnectionService {
   }
 
   async stop(): Promise<ConnectionStatusResult> {
-    await this.adapter.stop?.(this.connection?.alias);
-    return {
-      state: "stopped",
-      nextAction: NEXT_ACTIONS.stopped,
-      workspaceConfigurationIntact: await this.configurationIntact(),
-    };
+    const alias = this.connection?.alias ?? "workspace-lens";
+    if (this.adapter.stop !== undefined) {
+      await this.adapter.stop(alias);
+    }
+    return this.composeStatus("stopped");
   }
 
   async restart(): Promise<ConnectionStatusResult> {
     const input = await this.resolveConnectionInput();
+    let state: TunnelRuntimeState;
     if (this.adapter.restart !== undefined) {
       const raw = await this.adapter.restart(input);
-      const state = extractState(raw);
-      return {
-        state,
-        nextAction: NEXT_ACTIONS[state],
-        workspaceConfigurationIntact: await this.configurationIntact(),
-      };
+      state = extractState(raw);
+    } else {
+      await this.stop();
+      const raw = await this.adapter.connect(input);
+      state = extractState(raw);
     }
-    await this.stop();
-    const raw = await this.adapter.connect(input);
-    const state = extractState(raw);
-    return {
-      state,
-      nextAction: NEXT_ACTIONS[state],
-      workspaceConfigurationIntact: await this.configurationIntact(),
-    };
+    return this.composeStatus(state);
   }
 
   private async configurationIntact(): Promise<boolean> {
@@ -193,19 +353,171 @@ export class ConnectionService {
       return false;
     }
   }
-}
 
-function mapAdapterErrorToState(error: unknown): TunnelRuntimeState {
-  if (typeof error === "object" && error !== null && "code" in error) {
-    const code = (error as { code?: unknown }).code;
-    if (code === CONNECTION_ADAPTER_ERROR_CODES.ALIAS_MISSING) {
-      return "missing";
+  private async resolveConfirmations(): Promise<{
+    providerSetupUserConfirmed: boolean;
+    verificationUserConfirmed: boolean;
+  }> {
+    if (this.controlStateReader !== undefined) {
+      try {
+        const confirmations = await this.controlStateReader.getConfirmations();
+        return {
+          providerSetupUserConfirmed: confirmations.providerSetupUserConfirmed === true,
+          verificationUserConfirmed: confirmations.verificationUserConfirmed === true,
+        };
+      } catch {
+        return { providerSetupUserConfirmed: false, verificationUserConfirmed: false };
+      }
     }
-    if (code === CONNECTION_ADAPTER_ERROR_CODES.TUNNEL_UNHEALTHY) {
-      return "unhealthy";
+    return { providerSetupUserConfirmed: false, verificationUserConfirmed: false };
+  }
+
+  private async resolveCredentialStatus(): Promise<{
+    configured: boolean;
+    storeAvailable: boolean;
+  }> {
+    if (this.credentialStatus !== undefined) {
+      try {
+        const configured = await this.credentialStatus.isConfigured();
+        const storeAvailable =
+          this.credentialStatus.storeAvailable !== undefined
+            ? await this.credentialStatus.storeAvailable()
+            : true;
+        return { configured, storeAvailable };
+      } catch {
+        return { configured: false, storeAvailable: false };
+      }
+    }
+    if (this.connection?.getRuntimeApiKey !== undefined) {
+      try {
+        const key = await this.connection.getRuntimeApiKey();
+        const configured = typeof key === "string" && key.trim() !== "";
+        return { configured, storeAvailable: true };
+      } catch {
+        return { configured: false, storeAvailable: false };
+      }
+    }
+    if (this.connection?.runtimeApiKey !== undefined) {
+      const configured =
+        typeof this.connection.runtimeApiKey === "string" &&
+        this.connection.runtimeApiKey.trim() !== "";
+      return { configured, storeAvailable: true };
+    }
+    // Neither was configured - caller did not specify credential mechanism
+    return { configured: true, storeAvailable: true };
+  }
+
+  private async detectTunnelClient(): Promise<{
+    state: "available" | "missing" | "problem";
+    action?: string;
+  }> {
+    if (this.adapter.detect === undefined) {
+      return { state: "available" };
+    }
+    try {
+      const detected = await this.adapter.detect();
+      if (detected.installed) {
+        return { state: "available" };
+      }
+      return {
+        state: "missing",
+        action: "Install the tunnel-client executable.",
+      };
+    } catch (error: unknown) {
+      if (isBinaryMissing(error)) {
+        return {
+          state: "missing",
+          action: "Install the tunnel-client executable.",
+        };
+      }
+      return {
+        state: "problem",
+        action: "Check tunnel-client installation or open Diagnostics.",
+      };
     }
   }
-  return "problem";
+}
+
+function computeNextAction(layers: ConnectionLayers): string | undefined {
+  if (layers.tunnelClient.state === "missing") {
+    return layers.tunnelClient.action ?? "Install the tunnel-client executable.";
+  }
+  if (layers.tunnelClient.state === "problem") {
+    return layers.tunnelClient.action ?? "Check tunnel-client installation or open Diagnostics.";
+  }
+  if (layers.tunnelConfiguration.state === "action-required") {
+    return layers.tunnelConfiguration.action ?? "Store the runtime API key before connecting.";
+  }
+  if (
+    layers.tunnelConfiguration.state === "not-configured" ||
+    layers.tunnelRuntime.state === "missing"
+  ) {
+    return "Connect to create the tunnel runtime for this machine.";
+  }
+  if (layers.tunnelRuntime.state === "stopped") {
+    return "Connect to start the tunnel runtime.";
+  }
+  if (layers.tunnelRuntime.state === "unhealthy") {
+    return "Open Diagnostics and follow the connection recovery steps.";
+  }
+  if (layers.tunnelRuntime.state === "recovering") {
+    return "The runtime is recovering; wait for the next status update.";
+  }
+  if (layers.tunnelRuntime.state === "starting") {
+    return "The tunnel runtime is starting; wait for the next status update.";
+  }
+  if (layers.tunnelRuntime.state === "problem") {
+    return "Open Diagnostics and follow the connection recovery steps.";
+  }
+  // Tunnel runtime is healthy
+  if (layers.providerSetup.state === "not-confirmed") {
+    return "Complete provider-side setup in ChatGPT.";
+  }
+  if (layers.verification.state === "not-confirmed") {
+    return "Verify WorkspaceLens from ChatGPT and confirm.";
+  }
+  return undefined;
+}
+
+function isBinaryMissing(error: unknown): boolean {
+  if (typeof error === "object" && error !== null) {
+    const record = error as Record<string, unknown>;
+    if (
+      record.code === CONNECTION_ADAPTER_ERROR_CODES.TUNNEL_BINARY_MISSING ||
+      record.code === "ENOENT"
+    ) {
+      return true;
+    }
+    const message = typeof record.message === "string" ? record.message : "";
+    if (
+      /ENOENT|executable.*not.*found|not.*executable|no such file|command not found/i.test(
+        message,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isAliasMissingError(error: unknown): boolean {
+  if (typeof error === "object" && error !== null) {
+    const code = (error as { code?: unknown }).code;
+    if (code === CONNECTION_ADAPTER_ERROR_CODES.ALIAS_MISSING) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isTunnelUnhealthyError(error: unknown): boolean {
+  if (typeof error === "object" && error !== null) {
+    const code = (error as { code?: unknown }).code;
+    if (code === CONNECTION_ADAPTER_ERROR_CODES.TUNNEL_UNHEALTHY) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

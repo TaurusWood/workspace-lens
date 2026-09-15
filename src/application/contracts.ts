@@ -51,6 +51,36 @@ export type TunnelRuntimeState =
   | "recovering"
   | "problem";
 
+export interface ConnectionLayers {
+  localRuntime: {
+    state: "healthy";
+    evidence: "machine";
+  };
+  tunnelClient: {
+    state: "available" | "missing" | "problem";
+    evidence: "machine";
+    action?: string;
+  };
+  tunnelConfiguration: {
+    state: "configured" | "not-configured" | "action-required";
+    evidence: "machine";
+    action?: string;
+  };
+  tunnelRuntime: {
+    state: TunnelRuntimeState;
+    evidence: "machine";
+    action?: string;
+  };
+  providerSetup: {
+    state: "user-confirmed" | "not-confirmed";
+    evidence: "user" | "none";
+  };
+  verification: {
+    state: "user-confirmed" | "not-confirmed";
+    evidence: "user" | "none";
+  };
+}
+
 export interface ConnectionStatusResult {
   state: TunnelRuntimeState;
   /** Safe next step for the user when the state is not healthy. */
@@ -61,6 +91,22 @@ export interface ConnectionStatusResult {
    * configuration is never touched).
    */
   workspaceConfigurationIntact?: boolean;
+  /** Layered machine observation and user evidence (`docs/v0.3-ui-implementation-contract.md`). */
+  layers: ConnectionLayers;
+}
+
+/** Safe non-secret port for querying credential status. */
+export interface CredentialStatusPort {
+  isConfigured(): Promise<boolean>;
+  storeAvailable?(): Promise<boolean>;
+}
+
+/** Non-secret reader port for user-owned setup/verification confirmations. */
+export interface ControlStateReaderPort {
+  getConfirmations(): Promise<{
+    providerSetupUserConfirmed: boolean;
+    verificationUserConfirmed: boolean;
+  }>;
 }
 
 /**
@@ -77,6 +123,7 @@ export interface ConnectionRuntimeInput {
 export const CONNECTION_ADAPTER_ERROR_CODES = {
   ALIAS_MISSING: "ALIAS_MISSING",
   TUNNEL_UNHEALTHY: "TUNNEL_UNHEALTHY",
+  TUNNEL_BINARY_MISSING: "TUNNEL_BINARY_MISSING",
 } as const;
 
 export type ConnectionAdapterErrorCode =
