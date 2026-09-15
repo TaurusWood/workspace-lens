@@ -42,6 +42,7 @@ import { SessionStore } from "./session-store.js";
 import { createControlApp } from "./control-app.js";
 import { acquireRuntimeLock, type RuntimeLockHandle } from "./runtime-lock.js";
 import { createMcpHttpBridge } from "../mcp/http.js";
+import { SecretStore } from "../integrations/secrets/secret-store.js";
 
 export interface ControlRuntimeOptions {
   /** Workspace authorization config file (read-only for the runtime). */
@@ -206,26 +207,18 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
   // The privileged Control API is part of the runtime's default wiring: the
   // management routes exist under the full session gate for every caller
   // (CLI control, launcher child). Absent adapters degrade honestly.
-  const credentialStore = options.secretAdapter;
+  const secretNamespace = options.secretNamespace ?? "workspace-lens";
+  const credentialStore =
+    options.secretAdapter ?? new SecretStore({ namespace: secretNamespace });
   const credentials = {
     getRuntimeApiKey(): Promise<string | undefined> {
-      return credentialStore !== undefined
-        ? credentialStore.get(CREDENTIAL_NAME)
-        : Promise.resolve(undefined);
+      return credentialStore.get(CREDENTIAL_NAME);
     },
     setRuntimeApiKey(value: string): Promise<void> {
-      if (credentialStore === undefined) {
-        // No plaintext fallback exists (security contract §10.2).
-        return Promise.reject(
-          new Error("No credential store is available; no plaintext fallback is used."),
-        );
-      }
       return credentialStore.set(CREDENTIAL_NAME, value);
     },
     storeAvailable(): Promise<boolean> {
-      return credentialStore !== undefined
-        ? credentialStore.available()
-        : Promise.resolve(false);
+      return credentialStore.available();
     },
   };
   const realAdapter =
