@@ -6,12 +6,14 @@ import { runDoctor } from "./commands/doctor.js";
 import { runList } from "./commands/list.js";
 import { runRemove } from "./commands/remove.js";
 import { runServe } from "./commands/serve.js";
+import { runStartCli } from "./commands/start.js";
 import type { CliIo } from "./io.js";
 import { defaultIo } from "./io.js";
 
 const USAGE = `workspace-lens — read-only MCP context server for local workspaces
 
 Usage:
+  workspace-lens start [--port <port>]                   Start or reuse the local Control Runtime and open WebUI
   workspace-lens add <path> [--name <name>] [--id <id>]  Authorize a local workspace root
   workspace-lens list                                    List authorized workspaces
   workspace-lens remove <workspace>                      Remove an authorized workspace
@@ -32,6 +34,8 @@ async function dispatch(args: readonly string[], io: CliIo): Promise<number> {
   const rest = args.slice(1);
 
   switch (command) {
+    case "start":
+      return runStartCli(rest, io);
     case "add":
       return runAdd(rest, io);
     case "list":
