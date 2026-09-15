@@ -8,7 +8,7 @@ import { startControlRuntime, type ControlRuntimeHandle } from "../../../src/con
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createIsolatedProductEnv } from "../helpers/isolated-env.js";
-import { inMemorySecretAdapter } from "../helpers/test-adapters.js";
+import { inMemorySecretAdapter, stubTunnelAdapter } from "../helpers/test-adapters.js";
 import { establishSession, apiRequest } from "../helpers/control-api.js";
 
 async function connectMcpHttp(url: string): Promise<Client> {
@@ -36,6 +36,12 @@ const invocation = {
   argv: process.argv.slice(2),
   envKey: process.env.WORKSPACE_LENS_RUNTIME_KEY ?? null,
 };
+if (invocation.argv[0] === "help") {
+  const resp = scenario.help ?? { exitCode: 0, stdout: "tunnel-client help\\n", stderr: "" };
+  if (resp.stderr) process.stderr.write(resp.stderr);
+  if (resp.stdout) process.stdout.write(resp.stdout);
+  process.exit(resp.exitCode ?? 0);
+}
 const log = fs.existsSync(logPath) ? JSON.parse(fs.readFileSync(logPath, "utf8")) : [];
 log.push(invocation);
 fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
@@ -56,6 +62,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session = await establishSession(runtime.baseUrl);
@@ -78,13 +85,19 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
     }
   });
 
-  it("Case B: tunnel-client missing produces tunnelClient.state = missing with actionable nextAction", async () => {
+  it("Case B: detect() returns installed: false produces tunnelClient.state = missing even if status returns healthy", async () => {
+    let detectCalled = false;
+    let statusCalled = false;
     const mockAdapter = {
-      detect: async () => ({ installed: false }),
-      status: async () => {
-        throw new Error("spawn tunnel-client ENOENT");
+      detect: async () => {
+        detectCalled = true;
+        return { installed: false };
       },
-      connect: async () => ({ alias: "test", state: "healthy" }),
+      status: async () => {
+        statusCalled = true;
+        return { alias: "workspace-lens", status: "running", health: "healthy" };
+      },
+      connect: async () => ({ alias: "workspace-lens", state: "healthy" }),
     };
 
     const service = new ConnectionService({
@@ -99,9 +112,12 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
     });
 
     const status = await service.currentStatus();
+    expect(detectCalled).toBe(true);
+    expect(statusCalled).toBe(false);
     expect(status.layers.tunnelClient.state).toBe("missing");
     expect(status.layers.tunnelClient.evidence).toBe("machine");
     expect(status.layers.tunnelClient.action).toContain("Install");
+    expect(status.layers.tunnelRuntime.state).toBe("missing");
     expect(status.nextAction).toContain("Install");
     expect(status.layers.tunnelClient.state).not.toBe("problem");
   });
@@ -115,6 +131,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session = await establishSession(runtime.baseUrl);
@@ -267,6 +284,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session = await establishSession(runtime.baseUrl);
@@ -311,6 +329,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session = await establishSession(runtime.baseUrl);
@@ -349,6 +368,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session1 = await establishSession(runtime.baseUrl);
@@ -374,6 +394,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session2 = await establishSession(runtime.baseUrl);
@@ -407,6 +428,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session = await establishSession(runtime.baseUrl);
@@ -453,6 +475,7 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         controlStatePath: env.controlStatePath,
         runtimeStatePath: env.runtimeStatePath,
         secretAdapter: inMemorySecretAdapter(),
+        tunnelAdapter: stubTunnelAdapter("healthy"),
       });
 
       const session = await establishSession(runtime.baseUrl);
@@ -503,6 +526,103 @@ describe("Slice 12.5B — Backend Connection State Contract Closure", () => {
         "PATCH",
       );
       expect(secretRes.status).toBe(400);
+    } finally {
+      await runtime?.runtime.stop();
+      env.cleanup();
+    }
+  });
+
+  it("Task 12.5B-9: mutation and GET consistency — POST stop/connect/restart returns layers consistent with subsequent GET /connection", async () => {
+    const env = createIsolatedProductEnv("conn-mutation-consistency");
+    let runtime: ControlRuntimeHandle | undefined;
+    try {
+      const secretAdapter = inMemorySecretAdapter();
+      let simulatedState: "stopped" | "starting" | "healthy" = "stopped";
+      const tunnelAdapter = {
+        detect: async () => ({ installed: true }),
+        connect: async () => {
+          simulatedState = "healthy";
+          return { alias: "workspace-lens", state: "healthy" as const };
+        },
+        status: async () => ({ alias: "workspace-lens", state: simulatedState }),
+        stop: async () => {
+          simulatedState = "stopped";
+          return { alias: "workspace-lens", state: "stopped" as const };
+        },
+        restart: async () => {
+          simulatedState = "healthy";
+          return { alias: "workspace-lens", state: "healthy" as const };
+        },
+      };
+
+      runtime = await startControlRuntime({
+        configPath: env.configPath,
+        controlStatePath: env.controlStatePath,
+        runtimeStatePath: env.runtimeStatePath,
+        secretAdapter,
+        tunnelAdapter,
+      });
+
+      const session = await establishSession(runtime.baseUrl);
+      const headers = { cookie: session.cookie, csrf: session.csrf, origin: runtime.baseUrl };
+
+      // Set runtime API key via Control API
+      const credRes = await apiRequest(
+        runtime.baseUrl,
+        "/api/v1/credentials",
+        { runtimeApiKey: "test-secret-key" },
+        headers,
+      );
+      expect(credRes.status).toBe(201);
+
+      const assertConsistentLayers = (mutationLayers: any, getLayers: any) => {
+        expect(mutationLayers.localRuntime).toEqual(getLayers.localRuntime);
+        expect(mutationLayers.tunnelClient).toEqual(getLayers.tunnelClient);
+        expect(mutationLayers.tunnelConfiguration).toEqual(getLayers.tunnelConfiguration);
+        expect(mutationLayers.providerSetup).toEqual(getLayers.providerSetup);
+        expect(mutationLayers.verification).toEqual(getLayers.verification);
+        expect(mutationLayers.tunnelRuntime.state).toBe(getLayers.tunnelRuntime.state);
+      };
+
+      // 1. POST /api/v1/connection/connect
+      const connectRes = await apiRequest(runtime.baseUrl, "/api/v1/connection/connect", {}, headers);
+      expect(connectRes.status).toBe(200);
+      const connectBody = (await connectRes.json()) as any;
+
+      const getAfterConnect = await fetch(`${runtime.baseUrl}/api/v1/connection`, {
+        headers: { cookie: session.cookie },
+      });
+      const getConnectBody = (await getAfterConnect.json()) as any;
+      assertConsistentLayers(connectBody.layers, getConnectBody.layers);
+      expect(connectBody.state).toBe(getConnectBody.state);
+      expect(connectBody.nextAction).toBe(getConnectBody.nextAction);
+
+      // 2. POST /api/v1/connection/stop
+      const stopRes = await apiRequest(runtime.baseUrl, "/api/v1/connection/stop", {}, headers);
+      expect(stopRes.status).toBe(200);
+      const stopBody = (await stopRes.json()) as any;
+
+      const getAfterStop = await fetch(`${runtime.baseUrl}/api/v1/connection`, {
+        headers: { cookie: session.cookie },
+      });
+      const getStopBody = (await getAfterStop.json()) as any;
+      assertConsistentLayers(stopBody.layers, getStopBody.layers);
+      expect(stopBody.state).toBe("stopped");
+      expect(getStopBody.state).toBe("stopped");
+      expect(stopBody.nextAction).toBe(getStopBody.nextAction);
+
+      // 3. POST /api/v1/connection/restart
+      const restartRes = await apiRequest(runtime.baseUrl, "/api/v1/connection/restart", {}, headers);
+      expect(restartRes.status).toBe(200);
+      const restartBody = (await restartRes.json()) as any;
+
+      const getAfterRestart = await fetch(`${runtime.baseUrl}/api/v1/connection`, {
+        headers: { cookie: session.cookie },
+      });
+      const getRestartBody = (await getAfterRestart.json()) as any;
+      assertConsistentLayers(restartBody.layers, getRestartBody.layers);
+      expect(restartBody.state).toBe(getRestartBody.state);
+      expect(restartBody.nextAction).toBe(getRestartBody.nextAction);
     } finally {
       await runtime?.runtime.stop();
       env.cleanup();

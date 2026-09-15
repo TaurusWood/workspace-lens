@@ -147,8 +147,9 @@ export class TunnelRuntimeAdapter {
 
   /** Detect the managed-runtime binary; a missing binary is a stable error. */
   async detect(): Promise<{ installed: true }> {
+    const env: Record<string, string> = { ...process.env, ...this.env } as Record<string, string>;
     try {
-      await execFileAsync(this.executable, ["help"], { timeout: this.timeoutMs });
+      await execFileAsync(this.executable, ["help"], { env, timeout: this.timeoutMs });
       return { installed: true };
     } catch (error) {
       throw describeSpawnFailure(error, this.executable);
@@ -304,7 +305,7 @@ function describeSpawnFailure(
   const errno = error as NodeJS.ErrnoException;
   if (errno.code === "ENOENT") {
     return new TunnelAdapterError(
-      "TUNNEL_BINARY_MISSING",
+      CONNECTION_ADAPTER_ERROR_CODES.TUNNEL_BINARY_MISSING,
       `The tunnel-client executable was not found or is not executable: ${executable}`,
     );
   }

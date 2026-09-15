@@ -28,6 +28,12 @@ const invocation = {
   argv: process.argv.slice(2),
   envKey: process.env.WORKSPACE_LENS_RUNTIME_KEY ?? null,
 };
+if (invocation.argv[0] === "help") {
+  const resp = scenario.help ?? { exitCode: 0, stdout: "tunnel-client help\\n", stderr: "" };
+  if (resp.stderr) process.stderr.write(resp.stderr);
+  if (resp.stdout) process.stdout.write(resp.stdout);
+  process.exit(resp.exitCode ?? 0);
+}
 const log = fs.existsSync(logPath) ? JSON.parse(fs.readFileSync(logPath, "utf8")) : [];
 log.push(invocation);
 fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
@@ -65,6 +71,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
       const service = new ConnectionService({
         adapter,
         controlRuntime: { baseUrl: "http://127.0.0.1:59998", isHealthy: async () => true },
+        credentialStatus: { isConfigured: async () => true },
         configStore: { load: () => ({ version: 1, expose_absolute_paths: false, workspaces: [] }) },
         connection: {
           alias: "workspace-lens",
@@ -108,6 +115,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
       const service = new ConnectionService({
         adapter,
         controlRuntime: { baseUrl: "http://127.0.0.1:59998", isHealthy: async () => true },
+        credentialStatus: { isConfigured: async () => true },
         configStore: { load: () => ({ version: 1, expose_absolute_paths: false, workspaces: [] }) },
         connection: {
           alias: "workspace-lens",
@@ -151,6 +159,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
       const service = new ConnectionService({
         adapter,
         controlRuntime: { baseUrl: "http://127.0.0.1:59998", isHealthy: async () => true },
+        credentialStatus: { isConfigured: async () => true },
         configStore: { load: () => ({ version: 1, expose_absolute_paths: false, workspaces: [] }) },
         connection: {
           alias: "workspace-lens",
@@ -189,6 +198,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     const service = new ConnectionService({
       adapter: mockAdapter,
       controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
       connection: {
         alias: "workspace-lens",
         mcpServerUrl: () => `http://127.0.0.1:${boundPort}/mcp`,
@@ -246,6 +256,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
       const service = new ConnectionService({
         adapter,
         controlRuntime: { baseUrl: "http://127.0.0.1:50123", isHealthy: async () => true },
+        credentialStatus: { isConfigured: async () => true },
         connection: {
           alias: "workspace-lens",
           mcpServerUrl: () => "http://127.0.0.1:50123/mcp",
@@ -315,6 +326,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     const noConfigService = new ConnectionService({
       adapter: mockAdapter,
       controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
     });
     await expect(noConfigService.connect()).rejects.toThrow(/Connection configuration is missing/);
     await expect(noConfigService.restart()).rejects.toThrow(/Connection configuration is missing/);
@@ -323,6 +335,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     const emptyKeyService = new ConnectionService({
       adapter: mockAdapter,
       controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
       connection: {
         alias: "workspace-lens",
         mcpServerUrl: "http://127.0.0.1:42100/mcp",
@@ -336,6 +349,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     const undefinedKeyService = new ConnectionService({
       adapter: mockAdapter,
       controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
       connection: {
         alias: "workspace-lens",
         mcpServerUrl: "http://127.0.0.1:42100/mcp",
@@ -349,6 +363,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     const emptyUrlService = new ConnectionService({
       adapter: mockAdapter,
       controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
       connection: {
         alias: "workspace-lens",
         mcpServerUrl: "",
@@ -362,6 +377,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     const emptyAliasService = new ConnectionService({
       adapter: mockAdapter,
       controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
       connection: {
         alias: "",
         mcpServerUrl: "http://127.0.0.1:42100/mcp",

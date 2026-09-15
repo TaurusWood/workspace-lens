@@ -248,6 +248,7 @@ describe("CONN — tunnel adapter contracts", () => {
         },
       },
       controlRuntime: { baseUrl: "http://127.0.0.1:59998", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
       configStore: { load: () => ({ version: 1, expose_absolute_paths: false, workspaces: [] }) },
     });
     const state = await service.currentStatus();
@@ -270,6 +271,7 @@ describe("CONN — tunnel adapter contracts", () => {
         },
       },
       controlRuntime: { baseUrl: "http://127.0.0.1:59997", isHealthy: async () => true },
+      credentialStatus: { isConfigured: async () => true },
     });
     // Adding a second and third workspace must not create another tunnel.
     await service.ensureConnectedForWorkspaces(["ws-one"]);
