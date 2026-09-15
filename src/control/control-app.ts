@@ -21,7 +21,7 @@
  * - Zod DTO validation at the boundary with bounded product errors;
  * - GET routes never mutate (mutation verbs are separate routes).
  */
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ConfigStore, describeError } from "../config/config-store.js";
@@ -406,13 +406,50 @@ export function registerControlApi(app: Hono, services: ControlApiServices): voi
     return context.json({ configured: true }, 201);
   });
 
+  let connectionTransitionActive = false;
+  async function withConnectionTransition(
+    context: Context,
+    action: () => Promise<unknown>,
+  ) {
+    if (connectionTransitionActive) {
+      return context.json(
+        {
+          error: {
+            code: "CONNECTION_TRANSITION_ACTIVE",
+            message: "A connection transition is already in progress.",
+          },
+        },
+        409,
+      );
+    }
+    connectionTransitionActive = true;
+    try {
+      const result = await action();
+      return context.json(result);
+    } catch (error) {
+      return boundedError(context, "CONNECTION_FAILED", error);
+    } finally {
+      connectionTransitionActive = false;
+    }
+  }
+
+  async function checkRuntimeApiKey(
+    context: Context,
+  ): Promise<boolean> {
+    const runtimeApiKey = await services.credentials.getRuntimeApiKey();
+    if (runtimeApiKey === undefined) {
+      context.status(400);
+      return false;
+    }
+    return true;
+  }
+
   app.get("/api/v1/connection", async (context) =>
     context.json(await services.connection.currentStatus()),
   );
 
   app.post("/api/v1/connection/connect", async (context) => {
-    const runtimeApiKey = await services.credentials.getRuntimeApiKey();
-    if (runtimeApiKey === undefined) {
+    if (!(await checkRuntimeApiKey(context))) {
       return context.json(
         {
           error: {
@@ -423,14 +460,48 @@ export function registerControlApi(app: Hono, services: ControlApiServices): voi
         400,
       );
     }
-    try {
-      return context.json(await services.connection.connect());
-    } catch (error) {
-      return boundedError(context, "CONNECTION_FAILED", error);
+    return withConnectionTransition(context, () => services.connection.connect());
+  });
+
+  app.post("/api/v1/connection/start", async (context) => {
+    if (!(await checkRuntimeApiKey(context))) {
+      return context.json(
+        {
+          error: {
+            code: "CREDENTIAL_REQUIRED",
+            message: "Store the runtime API key before connecting.",
+          },
+        },
+        400,
+      );
     }
+    return withConnectionTransition(context, () => services.connection.start());
+  });
+
+  app.post("/api/v1/connection/stop", async (context) =>
+    withConnectionTransition(context, () => services.connection.stop()),
+  );
+
+  app.post("/api/v1/connection/restart", async (context) => {
+    if (!(await checkRuntimeApiKey(context))) {
+      return context.json(
+        {
+          error: {
+            code: "CREDENTIAL_REQUIRED",
+            message: "Store the runtime API key before connecting.",
+          },
+        },
+        400,
+      );
+    }
+    return withConnectionTransition(context, () => services.connection.restart());
   });
 
   app.get("/api/v1/diagnostics", async (context) =>
+    context.json({ checks: await services.diagnostics() }),
+  );
+
+  app.post("/api/v1/diagnostics/run", async (context) =>
     context.json({ checks: await services.diagnostics() }),
   );
 
