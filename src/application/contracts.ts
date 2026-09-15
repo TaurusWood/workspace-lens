@@ -80,8 +80,7 @@ export const CONNECTION_ADAPTER_ERROR_CODES = {
 } as const;
 
 export type ConnectionAdapterErrorCode =
-  | (typeof CONNECTION_ADAPTER_ERROR_CODES)[keyof typeof CONNECTION_ADAPTER_ERROR_CODES]
-  | (string & {});
+  (typeof CONNECTION_ADAPTER_ERROR_CODES)[keyof typeof CONNECTION_ADAPTER_ERROR_CODES];
 
 
 /**

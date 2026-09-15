@@ -303,7 +303,7 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     }
   });
 
-  it("fails closed when connection config, runtime API key, or MCP URL is missing or empty", async () => {
+  it("fails closed when connection config, runtime API key, MCP URL, or alias is missing or empty", async () => {
     const mockAdapter = {
       status: async () => ({ alias: "workspace-lens", status: "running" }),
       connect: async () => ({ alias: "workspace-lens", state: "healthy" }),
@@ -344,6 +344,32 @@ describe("Task 12.5A — Connection production wiring and state mapping", () => 
     });
     await expect(undefinedKeyService.connect()).rejects.toThrow(/Runtime API key is missing or empty/);
     await expect(undefinedKeyService.restart()).rejects.toThrow(/Runtime API key is missing or empty/);
+
+    // 4. Missing/empty MCP server URL
+    const emptyUrlService = new ConnectionService({
+      adapter: mockAdapter,
+      controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      connection: {
+        alias: "workspace-lens",
+        mcpServerUrl: "",
+        runtimeApiKey: "test-key",
+      },
+    });
+    await expect(emptyUrlService.connect()).rejects.toThrow(/MCP server URL is missing or unresolved/);
+    await expect(emptyUrlService.restart()).rejects.toThrow(/MCP server URL is missing or unresolved/);
+
+    // 5. Missing/empty alias
+    const emptyAliasService = new ConnectionService({
+      adapter: mockAdapter,
+      controlRuntime: { baseUrl: "http://127.0.0.1:42100", isHealthy: async () => true },
+      connection: {
+        alias: "",
+        mcpServerUrl: "http://127.0.0.1:42100/mcp",
+        runtimeApiKey: "test-key",
+      },
+    });
+    await expect(emptyAliasService.connect()).rejects.toThrow(/Tunnel alias is missing or empty/);
+    await expect(emptyAliasService.restart()).rejects.toThrow(/Tunnel alias is missing or empty/);
   });
 
   it("3. production composition: startControlRuntime -> authenticated Control API -> in-memory secret store -> ConnectionService -> real TunnelRuntimeAdapter -> recording stub", async () => {
