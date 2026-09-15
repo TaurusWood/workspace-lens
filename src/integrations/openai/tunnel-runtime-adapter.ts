@@ -20,7 +20,7 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { TunnelRuntimeState } from "../../application/contracts.js";
+import type { ConnectionRuntimeInput, TunnelRuntimeState } from "../../application/contracts.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -119,12 +119,7 @@ export interface TunnelRuntimeAdapterOptions {
   onInvocation?: (argv: string[]) => void;
 }
 
-export interface ConnectRuntimeInput {
-  alias: string;
-  mcpServerUrl: string;
-  /** Literal key value; passed via child env only, argv carries the reference. */
-  runtimeApiKey: string;
-}
+export type ConnectRuntimeInput = ConnectionRuntimeInput;
 
 export interface RuntimeStateResult {
   alias: string;
@@ -194,9 +189,9 @@ export class TunnelRuntimeAdapter {
   }
 
   /** Restart = stop (a missing alias is fine) + connect again. */
-  async restart(alias: string, input: ConnectRuntimeInput): Promise<RuntimeStateResult> {
+  async restart(input: ConnectionRuntimeInput): Promise<RuntimeStateResult> {
     try {
-      await this.stop(alias);
+      await this.stop(input.alias);
     } catch (error) {
       if (!(error instanceof TunnelAdapterError) || error.code !== "ALIAS_MISSING") {
         throw error;

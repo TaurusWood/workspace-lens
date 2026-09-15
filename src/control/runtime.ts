@@ -35,6 +35,7 @@ import { DiagnosticsService } from "../application/diagnostics-service.js";
 import { PromptHelperService } from "../application/prompt-helper-service.js";
 import { WorkspaceAdminService } from "../application/workspace-admin-service.js";
 import { SettingsService } from "../application/settings-service.js";
+import type { ConnectionRuntimeInput } from "../application/contracts.js";
 import { TunnelRuntimeAdapter } from "../integrations/openai/tunnel-runtime-adapter.js";
 import type { Hono } from "hono";
 import { registerControlApi } from "./control-app.js";
@@ -104,10 +105,10 @@ export interface CredentialStoreAdapter {
 
 export interface ManagedRuntimeAdapter {
   detect(): Promise<{ installed: boolean; version?: string }>;
-  connect(input: unknown): Promise<unknown>;
+  connect(input: ConnectionRuntimeInput): Promise<unknown>;
   status(alias: string): Promise<unknown>;
   stop(alias: string): Promise<unknown>;
-  restart(input: unknown): Promise<unknown>;
+  restart(input: ConnectionRuntimeInput): Promise<unknown>;
 }
 
 const CREDENTIAL_NAME = "runtime-api-key";
@@ -221,27 +222,17 @@ export async function startControlRuntime(options: ControlRuntimeOptions): Promi
       return credentialStore.available();
     },
   };
-  const realAdapter =
-    options.tunnelAdapter === undefined
-      ? new TunnelRuntimeAdapter({
-          executable: "tunnel-client",
-          // Child argv is captured metadata-only; the literal key travels via
-          // the child env and never appears in argv.
-          onInvocation: (argv) => {
-            if (capturedChildArgv.length < CAPTURE_LIMIT) {
-              capturedChildArgv.push(argv);
-            }
-          },
-        })
-      : undefined;
   const managedAdapter: ManagedRuntimeAdapter =
     options.tunnelAdapter ??
-    ({
-      detect: () => realAdapter!.detect(),
-      connect: (input: unknown) => realAdapter!.connect(input as never),
-      status: (alias: string) => realAdapter!.status(alias),
-      stop: (alias: string) => realAdapter!.stop(alias),
-      restart: (input: unknown) => realAdapter!.restart("workspace-lens", input as never),
+    new TunnelRuntimeAdapter({
+      executable: "tunnel-client",
+      // Child argv is captured metadata-only; the literal key travels via
+      // the child env and never appears in argv.
+      onInvocation: (argv) => {
+        if (capturedChildArgv.length < CAPTURE_LIMIT) {
+          capturedChildArgv.push(argv);
+        }
+      },
     });
   const configStore = new ConfigStore(options.configPath);
   const connectionService = new ConnectionService({

@@ -64,6 +64,27 @@ export interface ConnectionStatusResult {
 }
 
 /**
+ * Resolved connection runtime command input. Connect and restart share this
+ * single normalized contract across the application and integration boundary.
+ */
+export interface ConnectionRuntimeInput {
+  alias: string;
+  mcpServerUrl: string;
+  runtimeApiKey: string;
+}
+
+/** Stable adapter error codes recognized by application services. */
+export const CONNECTION_ADAPTER_ERROR_CODES = {
+  ALIAS_MISSING: "ALIAS_MISSING",
+  TUNNEL_UNHEALTHY: "TUNNEL_UNHEALTHY",
+} as const;
+
+export type ConnectionAdapterErrorCode =
+  | (typeof CONNECTION_ADAPTER_ERROR_CODES)[keyof typeof CONNECTION_ADAPTER_ERROR_CODES]
+  | (string & {});
+
+
+/**
  * Shared connection application service. Method direction follows the
  * frozen executable contracts (`tests/v0.3/connection/conn-adapter.test.ts`,
  * CONN-004/005): `currentStatus` is the single status entry point and

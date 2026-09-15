@@ -10,7 +10,12 @@
  * actionable state while the workspace configuration stays intact
  * (CONN-004). The raw adapter surface stays behind this boundary.
  */
-import type { ConnectionStatusResult, TunnelRuntimeState } from "./contracts.js";
+import {
+  CONNECTION_ADAPTER_ERROR_CODES,
+  type ConnectionRuntimeInput,
+  type ConnectionStatusResult,
+  type TunnelRuntimeState,
+} from "./contracts.js";
 
 const FROZEN_STATES: TunnelRuntimeState[] = [
   "missing",
@@ -33,9 +38,9 @@ const NEXT_ACTIONS: Partial<Record<TunnelRuntimeState, string>> = {
 
 export interface ConnectionAdapter {
   status(alias?: string): Promise<unknown>;
-  connect(input?: unknown): Promise<unknown>;
+  connect(input?: ConnectionRuntimeInput): Promise<unknown>;
   stop?(alias?: string): Promise<unknown>;
-  restart?(input?: unknown): Promise<unknown>;
+  restart?(input?: ConnectionRuntimeInput): Promise<unknown>;
 }
 
 export interface ConnectionServiceDependencies {
@@ -76,10 +81,10 @@ export class ConnectionService {
     let state: TunnelRuntimeState;
     try {
       state = extractState(await this.adapter.status(this.connection?.alias));
-    } catch {
+    } catch (error: unknown) {
       // Bounded failure: actionable state, never a control-plane crash and
       // never a claim that the provider side is fine.
-      state = "problem";
+      state = mapAdapterErrorToState(error);
     }
     return {
       state,
@@ -101,17 +106,25 @@ export class ConnectionService {
     return this.connect();
   }
 
+  private async resolveConnectionInput(): Promise<ConnectionRuntimeInput | undefined> {
+    if (this.connection === undefined) {
+      return undefined;
+    }
+    const runtimeApiKey =
+      (await this.connection.getRuntimeApiKey?.()) ?? this.connection.runtimeApiKey ?? "";
+    const mcpServerUrl =
+      typeof this.connection.mcpServerUrl === "function"
+        ? this.connection.mcpServerUrl()
+        : this.connection.mcpServerUrl;
+    return {
+      alias: this.connection.alias,
+      mcpServerUrl,
+      runtimeApiKey,
+    };
+  }
+
   async connect(): Promise<ConnectionStatusResult> {
-    const input = this.connection === undefined
-      ? undefined
-      : {
-          alias: this.connection.alias,
-          mcpServerUrl:
-            typeof this.connection.mcpServerUrl === "function"
-              ? this.connection.mcpServerUrl()
-              : this.connection.mcpServerUrl,
-          runtimeApiKey: (await this.connection.getRuntimeApiKey?.()) ?? this.connection.runtimeApiKey,
-        };
+    const input = await this.resolveConnectionInput();
     const raw = await this.adapter.connect(input);
     const state = extractState(raw);
     return {
@@ -140,8 +153,9 @@ export class ConnectionService {
   }
 
   async restart(): Promise<ConnectionStatusResult> {
+    const input = await this.resolveConnectionInput();
     if (this.adapter.restart !== undefined) {
-      const raw = await this.adapter.restart(this.connection);
+      const raw = await this.adapter.restart(input);
       const state = extractState(raw);
       return {
         state,
@@ -150,7 +164,13 @@ export class ConnectionService {
       };
     }
     await this.stop();
-    return this.connect();
+    const raw = await this.adapter.connect(input);
+    const state = extractState(raw);
+    return {
+      state,
+      nextAction: NEXT_ACTIONS[state],
+      workspaceConfigurationIntact: await this.configurationIntact(),
+    };
   }
 
   private async configurationIntact(): Promise<boolean> {
@@ -164,6 +184,19 @@ export class ConnectionService {
       return false;
     }
   }
+}
+
+function mapAdapterErrorToState(error: unknown): TunnelRuntimeState {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === CONNECTION_ADAPTER_ERROR_CODES.ALIAS_MISSING) {
+      return "missing";
+    }
+    if (code === CONNECTION_ADAPTER_ERROR_CODES.TUNNEL_UNHEALTHY) {
+      return "unhealthy";
+    }
+  }
+  return "problem";
 }
 
 /**
